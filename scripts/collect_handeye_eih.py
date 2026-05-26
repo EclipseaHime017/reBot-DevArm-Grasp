@@ -12,7 +12,7 @@ Eye-in-Hand 手眼标定 — 数据采集与计算（Gemini2 + reBotArm）
   ArUco 标记贴在工作台固定位置（不动）
 
 【用法】
-    cd /home/chlorine/seeed/cameraws
+    cd /home/seeed/Downloads/rebot_grasp
     python scripts/collect_handeye_eih.py           # 自动模式
     python scripts/collect_handeye_eih.py --manual  # 手动重力补偿模式
 """
@@ -29,13 +29,15 @@ import numpy as np
 import yaml
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
-from cameraws.drivers.camera import make_camera
-from cameraws.drivers.robot import RebotArm, ensure_rebot_sdk_in_syspath
-from cameraws.calibration.hand_eye import CalibMode, HandEyeCalibrator
+from drivers.camera import make_camera
+from drivers.robot.rebot_arm import RebotArm, ensure_rebot_sdk_in_syspath
+from calibration.hand_eye import CalibMode, HandEyeCalibrator
 
 
 # ==========================================

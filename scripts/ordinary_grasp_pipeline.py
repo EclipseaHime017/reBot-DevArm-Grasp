@@ -8,8 +8,8 @@
   4. 用 mask 中央截面中点 + 深度分位数反投影得到 3D 抓取点
 
 用法：
-  conda activate seeed
-  cd /home/chlorine/seeed/cameraws
+  conda activate graspnet
+  cd /home/seeed/Downloads/rebot_grasp
   python scripts/ordinary_grasp_pipeline.py
 """
 
@@ -25,15 +25,20 @@ from ultralytics import YOLO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SEEED_ROOT = PROJECT_ROOT.parent
-for _path in (SEEED_ROOT,):
+for _path in (PROJECT_ROOT,):
     path_str = str(_path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from cameraws.drivers.camera import make_camera
-from cameraws.utils.ordinary_grasp import draw_grasp, estimate_grasps, get_depth_mm, select_best_grasp
-from cameraws.utils.transforms import canonicalize_parallel_gripper_tcp_rotation, rotation_matrix_to_euler_zyx
+from drivers.camera import make_camera
+from utils.ordinary_grasp import draw_grasp, estimate_grasps, get_depth_mm, select_best_grasp
+from utils.transforms import canonicalize_parallel_gripper_tcp_rotation, rotation_matrix_to_euler_zyx
+from utils.yolo_runtime import (
+    ensure_jetson_tensorrt_importable,
+    is_open_vocab_model,
+    resolve_yolo_model_path,
+    yolo_predict_kwargs,
+)
 
 
 clicked_point = {"u": -1, "v": -1}
@@ -77,8 +82,8 @@ def main():
     det_cfg = cfg.get("detection", {})
     grasp_cfg = cfg.get("grasp_pipeline", {}).get("grasp", {})
 
-    model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
-    device = yolo_cfg.get("device", "cpu")
+    model_name = yolo_cfg.get("model_name", "yolo11n-seg.engine")
+    device = yolo_cfg.get("device", "auto")
     use_world = bool(yolo_cfg.get("use_world", False))
     custom_classes = list(yolo_cfg.get("custom_classes", ["cup"]))
     conf_thres = float(det_cfg.get("conf_threshold", 0.25))
@@ -86,12 +91,14 @@ def main():
     depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
 
     print("=== 初始化 YOLO 模型 ===")
-    model_path = models_dir / model_name
+    model_path = resolve_yolo_model_path(PROJECT_ROOT, model_name)
     print(f"加载模型: {model_path}")
+    ensure_jetson_tensorrt_importable()
     model = YOLO(str(model_path))
-    if use_world and ("world" in model_name.lower() or "yoloe" in model_name.lower()):
+    if use_world and is_open_vocab_model(model_name):
         model.set_classes(custom_classes)
         print(f"开放词汇类别: {custom_classes}")
+    predict_kwargs = yolo_predict_kwargs(model_name, device, conf_thres, iou_thres)
 
     print(f"\n=== 初始化相机: {cam_type} ===")
     cam = make_camera(cfg)
@@ -113,13 +120,7 @@ def main():
             if color_image is None or depth_mm is None:
                 continue
 
-            results = model.predict(
-                color_image,
-                verbose=False,
-                device=device,
-                conf=conf_thres,
-                iou=iou_thres,
-            )
+            results = model.predict(color_image, **predict_kwargs)
 
             grasps = estimate_grasps(results, depth_mm, K, depth_quantile=depth_quantile)
             for grasp in grasps:
