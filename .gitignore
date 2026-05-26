@@ -1,12 +1,10 @@
-instructions.md
+info
 Log
 data
 unused
 mobileclip2_b.ts
-PLAN.md
 __pycache__/
 *.pyc
 sdk/*
 models/
-scripts/graspnet_camera_demo.py
-scripts/grasp.py
+*.npz

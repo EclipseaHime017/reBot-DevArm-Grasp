@@ -43,5 +43,18 @@ graspnet:
 grasp_pipeline:
   infer_every_live: 3
   grasp:
-    depth_quantile: 0.6
+    depth_quantile: 0.5
     pregrasp_offset_m: 0.080
+    insertion_depth_m: 0.015
+    min_base_z_m: 0.00
+
+graspnet:
+  checkpoint: "checkpoint-rs.tar"
+  num_point: 20000
+  collision_thresh: 0.01
+  min_depth: 0.05
+  max_depth: 1.0
+  top_k: 50
+  target_class: null
+  target_margin_px: 12
+  target_expand_ratio: 1.35

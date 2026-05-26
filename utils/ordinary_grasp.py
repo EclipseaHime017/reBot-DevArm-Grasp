@@ -8,7 +8,12 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from .transforms import grasp_axes_to_rebot_tcp_rotation
+try:
+    from .common_utils import detection_count, tensor_to_numpy
+    from .transforms import grasp_axes_to_rebot_tcp_rotation
+except ImportError:  # 支持从 cameraws/ 目录内以 ``utils.ordinary_grasp`` 或脚本路径导入
+    from common_utils import detection_count, tensor_to_numpy
+    from transforms import grasp_axes_to_rebot_tcp_rotation
 
 
 @dataclass
@@ -42,17 +47,6 @@ def get_depth_mm(depth_map: np.ndarray, u: int, v: int, roi_size: int = 5) -> fl
     roi = depth_map[y1:y2, x1:x2]
     valid = roi[roi > 0]
     return float(np.median(valid)) if len(valid) > 0 else 0.0
-
-
-def detection_count(result: Any) -> int:
-    obb = getattr(result, "obb", None)
-    if obb is not None:
-        try:
-            return len(obb)
-        except Exception:
-            pass
-    boxes = getattr(result, "boxes", None)
-    return len(boxes) if boxes is not None else 0
 
 
 def estimate_grasps(
@@ -281,26 +275,12 @@ def _refine_grasp_line_from_mask(
     return refined_center.astype(np.float32), short_edge_points, float(grasp_span_px)
 
 
-def _tensor_to_numpy(value: Any) -> Optional[np.ndarray]:
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        return value
-    if hasattr(value, "detach"):
-        value = value.detach()
-    if hasattr(value, "cpu"):
-        value = value.cpu()
-    if hasattr(value, "numpy"):
-        return np.asarray(value.numpy())
-    return np.asarray(value)
-
-
 def _safe_attr_row(container: Any, attr: str, index: int) -> Optional[np.ndarray]:
     values = getattr(container, attr, None)
     if values is None:
         return None
     try:
-        return _tensor_to_numpy(values[index])
+        return tensor_to_numpy(values[index])
     except Exception:
         return None
 

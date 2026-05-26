@@ -119,7 +119,10 @@ class RebotArm:
             load_robot_model,
             compute_fk,
             get_end_effector_frame_id,
+            pos_rot_to_se3,
+            IKSolverParams,
         )
+        from reBotArm_control_py.kinematics.inverse_kinematics import solve_ik
         from reBotArm_control_py.controllers import ArmEndPos
 
         cfg = str(config_path) if config_path else None
@@ -133,6 +136,9 @@ class RebotArm:
         self._data = self._model.createData()
         self._ee_frame_id = get_end_effector_frame_id(self._model)
         self._compute_fk = compute_fk
+        self._pos_rot_to_se3 = pos_rot_to_se3
+        self._solve_ik = solve_ik
+        self._ik_check_params = IKSolverParams(max_iter=200, tolerance=1e-4, step_size=0.5, damping=1e-6)
 
         self._endpos_ctrl: Optional[ArmEndPos] = None
         self._ArmEndPos = ArmEndPos
@@ -497,6 +503,30 @@ class RebotArm:
         return T
 
     # ── 运动控制 ──────────────────────────────────────────────────────────────
+
+    def check_ik(
+        self,
+        x: float, y: float, z: float,
+        roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0,
+    ) -> tuple[bool, float]:
+        """只求解 IK，不发送任何运动指令。"""
+        self._arm._request_and_poll()
+        q_curr, _, _ = self._arm.get_state()
+        target = self._pos_rot_to_se3(
+            np.array([x, y, z], dtype=np.float64),
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+        )
+        result = self._solve_ik(
+            self._model,
+            self._data,
+            self._ee_frame_id,
+            target,
+            q_curr,
+            self._ik_check_params,
+        )
+        return bool(result.success), float(result.error)
 
     def move_to(
         self,

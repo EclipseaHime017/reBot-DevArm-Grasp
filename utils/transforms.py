@@ -187,3 +187,62 @@ def grasp_rotation_to_rebot_tcp_rotation(grasp_rotation: np.ndarray) -> np.ndarr
     if R.shape != (3, 3):
         raise ValueError(f"grasp_rotation 必须为 (3, 3)，实际为 {R.shape}")
     return grasp_axes_to_rebot_tcp_rotation(R[:, 0], R[:, 1], R[:, 2])
+
+
+def _make_grasp_base_transform(
+    position_cam: np.ndarray,
+    tcp_rotation_cam: np.ndarray,
+    T_cam2base: np.ndarray,
+) -> np.ndarray:
+    T_grasp_cam = np.eye(4, dtype=np.float64)
+    T_grasp_cam[:3, :3] = np.asarray(tcp_rotation_cam, dtype=np.float64)
+    T_grasp_cam[:3, 3] = np.asarray(position_cam, dtype=np.float64)
+
+    T_grasp_base = np.asarray(T_cam2base, dtype=np.float64) @ T_grasp_cam
+    T_grasp_base[:3, :3] = canonicalize_parallel_gripper_tcp_rotation(T_grasp_base[:3, :3])
+    return T_grasp_base
+
+
+def _offset_along_tool_x(T: np.ndarray, offset_m: float) -> np.ndarray:
+    T_offset = T.copy()
+    T_offset[:3, 3] = T[:3, 3] - T[:3, 0] * float(offset_m)
+    return T_offset
+
+
+def transform_grasp_pose_to_base(
+    position_cam: np.ndarray,
+    tcp_rotation_cam: np.ndarray,
+    T_cam2base: np.ndarray,
+    pregrasp_offset_m: float,
+    insertion_depth_m: float = 0.0,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """将相机坐标系下的夹取位姿转换为 base 坐标系下的夹取/预夹取 6D 位姿。"""
+    T_grasp_base = _make_grasp_base_transform(position_cam, tcp_rotation_cam, T_cam2base)
+    T_grasp_base = _offset_along_tool_x(T_grasp_base, -insertion_depth_m)
+    T_pregrasp_base = _offset_along_tool_x(T_grasp_base, pregrasp_offset_m)
+    return mat4_to_pose6d(T_grasp_base), mat4_to_pose6d(T_pregrasp_base)
+
+
+def transform_grasp_pose_to_base_with_retreat(
+    position_cam: np.ndarray,
+    tcp_rotation_cam: np.ndarray,
+    T_cam2base: np.ndarray,
+    pregrasp_offset_m: float,
+    retreat_offset_m: float,
+    insertion_depth_m: float = 0.0,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    """将相机系夹取位姿转换为 base 系夹取、预夹取和撤退 6D 位姿。"""
+    T_grasp_base = _make_grasp_base_transform(position_cam, tcp_rotation_cam, T_cam2base)
+    T_grasp_base = _offset_along_tool_x(T_grasp_base, -insertion_depth_m)
+    T_pregrasp_base = _offset_along_tool_x(T_grasp_base, pregrasp_offset_m)
+    T_retreat_base = _offset_along_tool_x(T_grasp_base, retreat_offset_m)
+    return mat4_to_pose6d(T_grasp_base), mat4_to_pose6d(T_pregrasp_base), mat4_to_pose6d(T_retreat_base)
+
+
+def graspnet_rotation_to_rebot_tcp_rotation(grasp_rotation: np.ndarray) -> np.ndarray:
+    """将 GraspNet rotation_matrix 转换为 reBotArm TCP 旋转矩阵。"""
+    R = np.asarray(grasp_rotation, dtype=np.float64)
+    if R.shape != (3, 3):
+        raise ValueError(f"grasp_rotation must be (3, 3), got {R.shape}")
+
+    return _nearest_rotation_matrix(np.column_stack([R[:, 0], R[:, 1], np.cross(R[:, 0], R[:, 1])]))

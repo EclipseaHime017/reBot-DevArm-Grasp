@@ -43,21 +43,30 @@ class RealsenseCamera(CameraDriver):
         except ImportError as e:
             raise RuntimeError(f"未安装 pyrealsense2，请执行: pip install pyrealsense2: {e}") from e
 
-        pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.color, self._w, self._h, rs.format.bgr8, self._fps)
-        config.enable_stream(rs.stream.depth, self._w, self._h, rs.format.z16, self._fps)
-
-        try:
-            profile = pipeline.start(config)
-        except RuntimeError as e:
+        errors = []
+        for width, height, fps in self._profile_candidates():
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+            config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+            try:
+                profile = pipeline.start(config)
+                self._pipeline = pipeline
+                self._align = rs.align(rs.stream.color)
+                self._w, self._h, self._fps = width, height, fps
+                break
+            except RuntimeError as e:
+                errors.append(f"{width}x{height}@{fps}: {e}")
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+        else:
             raise RuntimeError(
-                f"RealSense 相机未找到: {e}\n"
-                "  可能原因: 未插入 / USB 接口松动 / 被其他程序占用"
-            ) from e
-
-        self._pipeline = pipeline
-        self._align = rs.align(rs.stream.color)
+                "RealSense 相机未找到或无可用 RGB-D profile:\n  "
+                + "\n  ".join(errors)
+                + "\n  可能原因: 未插入 / USB 接口松动 / 被其他程序占用"
+            )
 
         # 内参
         intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
@@ -137,3 +146,20 @@ class RealsenseCamera(CameraDriver):
                 except Exception:
                     pass
         return np.zeros((1, 5), dtype=np.float64)
+
+    def _profile_candidates(self) -> list[tuple[int, int, int]]:
+        requested = (int(self._w), int(self._h), int(self._fps))
+        candidates = [
+            requested,
+            (1280, 720, 15),
+            (848, 480, 30),
+            (640, 480, 30),
+            (640, 480, 15),
+        ]
+        unique = []
+        seen = set()
+        for item in candidates:
+            if item not in seen:
+                unique.append(item)
+                seen.add(item)
+        return unique

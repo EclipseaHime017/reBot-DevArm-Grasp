@@ -10,6 +10,7 @@
 用法：
   conda activate graspnet
   cd /home/seeed/Downloads/rebot_grasp
+  conda activate seeed
   python scripts/ordinary_grasp_pipeline.py
 """
 
