@@ -32,17 +32,13 @@ robot:
     duration: 3.0
 
 yolo:
-  model_name: "yoloe-26l-seg.pt"
-  device: "cpu"
-  use_world: true
-  custom_classes:
-    - "yellow banana"
-    - "water bottle"
-    - "light blue coffee cup"
-    - "cup"
-    - "green object"
-    - "red object"
-    - "tool"
+  model_name: "yolo11n-seg.engine"
+  device: "auto"
+  use_world: false
+  custom_classes: []
+
+graspnet:
+  checkpoint: "checkpoint-rs.tar"
 
 grasp_pipeline:
   infer_every_live: 3

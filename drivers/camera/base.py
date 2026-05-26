@@ -68,7 +68,7 @@ class CameraDriver(ABC):
             dict_id:          cv2.aruco 字典 ID，默认 DICT_4X4_50 = 0
             target_marker_id: 只检测该 ID；None = 取距离最近的
         """
-        from cameraws.calibration.aruco_pose import ArUcoDetector
+        from calibration.aruco_pose import ArUcoDetector
         self._aruco = ArUcoDetector(marker_length_m, dict_id, target_marker_id)
 
     def detect_aruco(self, bgr: np.ndarray):

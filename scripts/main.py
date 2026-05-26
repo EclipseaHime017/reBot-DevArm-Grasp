@@ -36,6 +36,30 @@ from utils.transforms import (
     rotation_matrix_to_euler_zyx,
     transform_grasp_pose_to_base,
 )
+from utils.yolo_runtime import (
+    ensure_jetson_tensorrt_importable,
+    is_open_vocab_model,
+    resolve_yolo_model_path,
+    yolo_predict_kwargs,
+)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def load_hand_eye(project_root: Path, cam_type: str) -> tuple[Optional[np.ndarray], Optional[str]]:
+    hand_eye_path = project_root / "config" / "calibration" / cam_type / "hand_eye.npz"
+    if not hand_eye_path.exists():
+        return None, None
+
+    data = np.load(str(hand_eye_path), allow_pickle=False)
+    T = data["T_result"].astype(np.float64)
+    mode = str(data["mode"][0])
+    return T, mode
 from utils.yolo_utils import load_yolo
 
 
@@ -155,17 +179,21 @@ def main() -> int:
         {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
     )
 
-    print("=== 初始化机械臂 ===")
-    robot = RebotArm(
-        config_path=robot_cfg.get("config_path"),
-        urdf_path=robot_cfg.get("urdf_path"),
-        repo_root=robot_cfg.get("repo_root"),
-    )
-    robot.connect(enable=True)
-    robot.init_gripper()
+    robot: Optional[RebotArm] = None
+    if args.dry_run:
+        print("=== 机械臂: --dry-run，跳过串口连接和运动 ===")
+    else:
+        print("=== 初始化机械臂 ===")
+        robot = RebotArm(
+            config_path=robot_cfg.get("config_path"),
+            urdf_path=robot_cfg.get("urdf_path"),
+            repo_root=robot_cfg.get("repo_root"),
+        )
+        robot.connect(enable=True)
+        robot.init_gripper()
 
-    print("[Robot] 移动到预备位置...")
-    _move_ready(robot, ready_cfg)
+        print("[Robot] 移动到预备位置...")
+        _move_ready(robot, ready_cfg)
 
     cam_type = str(cfg.get("camera", {}).get("type", "")).lower()
     T_hand_eye, hand_eye_mode = load_hand_eye(PROJECT_ROOT, cam_type)
@@ -183,12 +211,22 @@ def main() -> int:
     gp_cfg = cfg.get("grasp_pipeline", {})
     grasp_cfg = gp_cfg.get("grasp", {})
 
+    model_name = yolo_cfg.get("model_name", "yolo11n-seg.engine")
+    yolo_device = yolo_cfg.get("device", "auto")
+    conf = float(det_cfg.get("conf_threshold", 0.25))
+    iou = float(det_cfg.get("iou_threshold", 0.45))
     model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
     pregrasp_offset_m = float(grasp_cfg.get("pregrasp_offset_m", 0.08))
     depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
     infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
 
     print(f"=== 加载 YOLO: {model_name} ===")
+    model_path = resolve_yolo_model_path(PROJECT_ROOT, model_name)
+    ensure_jetson_tensorrt_importable()
+    model = YOLO(str(model_path))
+    if yolo_cfg.get("use_world", False) and is_open_vocab_model(model_name):
+        model.set_classes(list(yolo_cfg.get("custom_classes", [])))
+    predict_kwargs = yolo_predict_kwargs(model_name, yolo_device, conf, iou)
     model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
 
     last_results: list[Any] = []
@@ -219,6 +257,7 @@ def main() -> int:
                 fps_timer = now
 
             if not frozen and (frame_index % infer_every == 0 or not last_results):
+                last_results = model.predict(color_bgr, **predict_kwargs)
                 last_results = model.predict(
                     color_bgr,
                     verbose=False,
@@ -254,6 +293,7 @@ def main() -> int:
                     print("[G] 采帧失败")
                     continue
 
+                snap_results = model.predict(snap_color, **predict_kwargs)
                 snap_results = model.predict(
                     snap_color,
                     verbose=False,
@@ -275,8 +315,8 @@ def main() -> int:
                 last_results = snap_results
                 last_grasps = snap_grasps
 
-                if T_hand_eye is None:
-                    print("[G] 手眼标定不可用，无法执行夹取")
+                if T_hand_eye is None or robot is None:
+                    print("[G] 手眼标定或机械臂不可用，跳过执行夹取")
                     continue
 
                 T_cam2base = _cam_to_base(T_hand_eye, robot)
@@ -289,13 +329,15 @@ def main() -> int:
                 _execute_grasp(robot, grasp6d, pre6d, ready_cfg, dry_run=args.dry_run)
 
     finally:
-        print("\n[退出] 释放夹爪并回零...")
-        try:
-            robot.release_gripper()
-            robot.safe_home()
-        except Exception as exc:
-            print(f"[退出] {exc}")
-        robot.disconnect()
+        print("\n[退出] 释放资源...")
+        if robot is not None:
+            print("[退出] 释放夹爪并回零...")
+            try:
+                robot.release_gripper()
+                robot.safe_home()
+            except Exception as exc:
+                print(f"[退出] {exc}")
+            robot.disconnect()
         cam.close()
         cv2.destroyAllWindows()
         print("已退出。")

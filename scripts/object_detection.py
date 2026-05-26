@@ -3,8 +3,9 @@
 特性：外部 YAML 配置化、动态模型加载、统一 3D 坐标系转换
 
 用法：
-    cd /your/path/to/cameraws
-    python scripts/main.py
+    conda activate graspnet
+    cd /home/seeed/Downloads/rebot_grasp
+    python scripts/object_detection.py
 """
 
 import os
@@ -16,6 +17,17 @@ import yaml
 import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.yolo_runtime import (
+    ensure_jetson_tensorrt_importable,
+    is_open_vocab_model,
+    resolve_yolo_model_path,
+    yolo_predict_kwargs,
+)
 
 # ==========================================
 # 全局状态与鼠标回调
@@ -63,30 +75,31 @@ def main():
     cam_type = cfg.get("camera", {}).get("type", "").lower()
 
     yolo_cfg     = cfg.get("yolo", {})
-    model_name   = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
-    device       = yolo_cfg.get("device", "cpu")
+    model_name   = yolo_cfg.get("model_name", "yolo11n-seg.engine")
+    device       = yolo_cfg.get("device", "auto")
     use_world    = yolo_cfg.get("use_world", False)
     custom_classes = yolo_cfg.get("custom_classes", ["person", "cup", "cell phone"])
 
-    model_path = models_dir / model_name
+    model_path = resolve_yolo_model_path(project_root, model_name)
 
     print(f"=== 初始化 YOLO 模型 ===")
     print(f"尝试加载模型: {model_path}")
+    ensure_jetson_tensorrt_importable()
     model = YOLO(str(model_path))
 
-    is_open_vocab = use_world and ("world" in model_name.lower() or "yoloe" in model_name.lower())
+    is_open_vocab = use_world and is_open_vocab_model(model_name)
     if is_open_vocab:
         print(f"启用开放词汇 (Open-Vocabulary) 模式，注入 {len(custom_classes)} 种物品概念...")
         model.set_classes(custom_classes)
 
-    print(f"YOLO 模型加载完毕！使用计算平台: {device.upper()}")
+    print(f"YOLO 模型加载完毕！使用计算平台: {str(device).upper()}")
     if "26" in model_name:
         print(f"[*] 检测到 YOLO26 家族模型，将启用免 NMS 端到端极速推理特性。")
+    predict_kwargs = yolo_predict_kwargs(model_name, device)
 
     # ── 相机（统一通过驱动接口）──
     print(f"\n=== 初始化相机: {cam_type} ===")
-    sys.path.insert(0, str(project_root.parent))
-    from cameraws.drivers.camera import make_camera
+    from drivers.camera import make_camera
 
     try:
         cam = make_camera(cfg)
@@ -116,7 +129,7 @@ def main():
             if color_image is None:
                 continue
 
-            results = model.predict(color_image, verbose=False, device=device)
+            results = model.predict(color_image, **predict_kwargs)
 
             for r in results:
                 for box in r.boxes:
