@@ -284,6 +284,8 @@ def main():
     parser = argparse.ArgumentParser(description="Eye-in-Hand 手眼标定采集")
     parser.add_argument("--manual", action="store_true",
                         help="手动模式：重力补偿，用户推臂到目标位置后按 Enter 采集")
+    parser.add_argument("--start-now", action="store_true",
+                        help="自动模式：跳过对准等待，启动后立即连接机械臂并遍历姿态")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -314,12 +316,13 @@ def main():
         "enabled": not args.manual,
         "idx": 0,
         "pose_idx": None,
-        "phase": "idle",
+        "phase": "idle" if args.manual or args.start_now else "aligning",
         "settle_until": 0.0,
         "timeout_at": 0.0,
         "stable_frames": 0,
-        "status": "等待启动",
+        "status": "对准 ArUco 后按 Enter 开始自动采集" if not args.manual and not args.start_now else "等待启动",
         "finished": False,
+        "last_marker_log_at": 0.0,
     }
     result_saved = [False]
 
@@ -331,13 +334,16 @@ def main():
             gc_ctrl.start()
             print(f"[机器人] 手动模式就绪 — 推动机械臂定位后按 Enter 采集")
         else:
-            robot = RebotArm(
-                config_path=robot_cfg.get("config_path"),
-                urdf_path=robot_cfg.get("urdf_path"),
-                repo_root=robot_cfg.get("repo_root"),
-            )
-            robot.connect(enable=True)
-            print(f"[机器人] 自动模式就绪，共 {len(CALIB_POSES_XYZ)} 个预设姿态，将自动遍历采集")
+            if args.start_now:
+                robot = RebotArm(
+                    config_path=robot_cfg.get("config_path"),
+                    urdf_path=robot_cfg.get("urdf_path"),
+                    repo_root=robot_cfg.get("repo_root"),
+                )
+                robot.connect(enable=True)
+                print(f"[机器人] 自动模式就绪，共 {len(CALIB_POSES_XYZ)} 个预设姿态，将自动遍历采集")
+            else:
+                print("[机器人] 自动模式待机 — 先打开相机对准 ArUco，按 Enter 后再连接机械臂")
     except Exception as e:
         print(f"[机器人] 连接失败: {e}")
         sys.exit(1)
@@ -349,7 +355,7 @@ def main():
     if args.manual:
         print("【操作】Enter=采集  c/q=结束并计算  pos=当前末端位置")
     else:
-        print("【操作】自动遍历姿态并自动采样  c/q=中断并计算  pos=当前末端位置")
+        print("【操作】先对准 ArUco，Enter=开始自动遍历  c/q=退出  pos=当前末端位置")
     print()
 
     # ── 开启相机 ──
@@ -369,9 +375,12 @@ def main():
     def _get_fk() -> np.ndarray:
         """读取当前末端位姿（两种模式均适用）。"""
         if args.manual:
+            if gc_ctrl is None:
+                raise RuntimeError("手动控制器尚未连接")
             return gc_ctrl.get_tcp_pose()
-        else:
-            return robot.get_tcp_pose()
+        if robot is None:
+            raise RuntimeError("机械臂尚未连接；自动模式下请先对准 ArUco 后按 Enter 开始")
+        return robot.get_tcp_pose()
 
     def _print_fk() -> None:
         try:
@@ -432,6 +441,39 @@ def main():
             print(f"[结果] [错误] 计算失败: {e}")
             return False
 
+    def marker_text(cur) -> str:
+        if cur is None:
+            return "No marker"
+        bbox = cur.bbox_xyxy
+        z = float(cur.T_marker2cam[2, 3])
+        if bbox is None:
+            return f"ID={cur.id} z={z:.3f}m"
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        return f"ID={cur.id} bbox=({x1},{y1},{x2},{y2}) center=({cx},{cy}) z={z:.3f}m"
+
+    def connect_auto_robot() -> bool:
+        nonlocal robot
+        if robot is not None:
+            return True
+        try:
+            print("\n[机器人] 正在连接机械臂...")
+            robot = RebotArm(
+                config_path=robot_cfg.get("config_path"),
+                urdf_path=robot_cfg.get("urdf_path"),
+                repo_root=robot_cfg.get("repo_root"),
+            )
+            robot.connect(enable=True)
+            print(f"[机器人] 自动模式开始，共 {len(CALIB_POSES_XYZ)} 个预设姿态")
+            return True
+        except Exception as e:
+            robot = None
+            auto["phase"] = "aligning"
+            auto["status"] = f"机械臂连接失败: {e}"
+            print(f"[机器人] 连接失败: {e}")
+            return False
+
     def start_next_auto_pose() -> bool:
         if not auto["enabled"] or robot is None:
             return False
@@ -465,6 +507,17 @@ def main():
     def tick_auto(cur) -> bool:
         if not auto["enabled"] or auto["finished"]:
             return auto["finished"]
+
+        if auto["phase"] == "aligning":
+            now = time.monotonic()
+            if cur is not None:
+                auto["status"] = f"对准中: {marker_text(cur)}  Enter=开始"
+                if now - float(auto["last_marker_log_at"]) > 1.0:
+                    print(f"\r[对准] {marker_text(cur)}  Enter=开始自动采集", end="", flush=True)
+                    auto["last_marker_log_at"] = now
+            else:
+                auto["status"] = "对准中: 未检测到 ArUco  c/q=退出"
+            return False
 
         if auto["phase"] == "idle":
             return start_next_auto_pose()
@@ -522,6 +575,17 @@ def main():
             _print_fk()
             return False
 
+        if auto["enabled"] and auto["phase"] == "aligning" and line == "":
+            if latest_pose[0] is None:
+                print("\n[对准] 还没有检测到 ArUco；请先让二维码进入画面再按 Enter")
+                return False
+            print(f"\n[对准] 已检测到 {marker_text(latest_pose[0])}，开始自动采集")
+            if connect_auto_robot():
+                auto["phase"] = "idle"
+                auto["status"] = "准备移动到第一个姿态"
+                start_next_auto_pose()
+            return False
+
         if args.manual and line == "":
             capture_sample(latest_pose[0], "手动采集")
             return False
@@ -530,8 +594,18 @@ def main():
             if args.manual:
                 print("  手动模式支持: Enter=采集  c/q=结束并计算  pos=当前末端位姿")
             else:
-                print("  自动模式支持: c/q=结束并计算  pos=当前末端位姿")
+                print("  自动模式支持: Enter=开始  c/q=结束并计算  pos=当前末端位姿")
         return False
+
+    def start_auto_from_alignment() -> None:
+        if latest_pose[0] is None:
+            print("\n[对准] 还没有检测到 ArUco；请先让二维码进入画面再按 Enter")
+            return
+        print(f"\n[对准] 已检测到 {marker_text(latest_pose[0])}，开始自动采集")
+        if connect_auto_robot():
+            auto["phase"] = "idle"
+            auto["status"] = "准备移动到第一个姿态"
+            start_next_auto_pose()
 
     # ── 主循环 ──
     WIN = "Eye-in-Hand Calibration  (operate in terminal)"
@@ -586,9 +660,12 @@ def main():
 
                 cv2.imshow(WIN, vis)
 
-            if cv2.waitKey(30) & 0xFF in [ord('q'), ord('Q'), 27]:
+            key = cv2.waitKey(30) & 0xFF
+            if key in [ord('q'), ord('Q'), 27]:
                 finish_reason = "窗口退出"
                 break
+            if key in [10, 13] and auto["enabled"] and auto["phase"] == "aligning":
+                start_auto_from_alignment()
             if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
                 finish_reason = "窗口关闭"
                 break

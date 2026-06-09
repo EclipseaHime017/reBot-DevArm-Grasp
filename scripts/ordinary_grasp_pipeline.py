@@ -8,8 +8,6 @@
   4. 用 mask 中央截面中点 + 深度分位数反投影得到 3D 抓取点
 
 用法：
-  conda activate graspnet
-  cd /home/seeed/Downloads/rebot_grasp
   conda activate seeed
   python scripts/ordinary_grasp_pipeline.py
 """

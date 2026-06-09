@@ -13,6 +13,16 @@ class MarkerPose:
     """单个 ArUco 标记的检测结果。"""
     id: int
     T_marker2cam: np.ndarray   # (4, 4) 标记到相机坐标系的变换
+    corners_px: Optional[np.ndarray] = None  # (4, 2) 像素角点
+
+    @property
+    def bbox_xyxy(self) -> Optional[tuple[int, int, int, int]]:
+        if self.corners_px is None:
+            return None
+        pts = np.asarray(self.corners_px, dtype=np.float64).reshape(-1, 2)
+        x1, y1 = np.min(pts, axis=0)
+        x2, y2 = np.max(pts, axis=0)
+        return (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
 
 
 class ArUcoDetector:
@@ -35,6 +45,58 @@ class ArUcoDetector:
         self._dict = cv2.aruco.getPredefinedDictionary(aruco_dict_id)
         self._params = cv2.aruco.DetectorParameters()
         self._detector = cv2.aruco.ArucoDetector(self._dict, self._params)
+
+    def _estimate_pose_single_marker(
+        self,
+        corner: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Estimate one marker pose, supporting OpenCV builds without old ArUco helpers."""
+        if hasattr(cv2.aruco, "estimatePoseSingleMarkers"):
+            rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
+                [corner], self._length, K, D
+            )
+            if rvec is None or tvec is None:
+                return None
+            return (
+                np.asarray(rvec[0], dtype=np.float64).reshape(3, 1),
+                np.asarray(tvec[0], dtype=np.float64).reshape(3, 1),
+            )
+
+        image_points = np.asarray(corner, dtype=np.float64).reshape(4, 2)
+        half = float(self._length) / 2.0
+        object_points = np.array(
+            [
+                [-half,  half, 0.0],
+                [ half,  half, 0.0],
+                [ half, -half, 0.0],
+                [-half, -half, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        flags = getattr(cv2, "SOLVEPNP_IPPE_SQUARE", cv2.SOLVEPNP_ITERATIVE)
+        ok, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            np.asarray(K, dtype=np.float64),
+            np.asarray(D, dtype=np.float64).reshape(-1, 1),
+            flags=flags,
+        )
+        if not ok and flags != cv2.SOLVEPNP_ITERATIVE:
+            ok, rvec, tvec = cv2.solvePnP(
+                object_points,
+                image_points,
+                np.asarray(K, dtype=np.float64),
+                np.asarray(D, dtype=np.float64).reshape(-1, 1),
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        if not ok:
+            return None
+        return (
+            np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+        )
 
     def detect(
         self,
@@ -74,21 +136,22 @@ class ArUcoDetector:
         best_z = float("inf")
 
         for corner, mid in zip(corners, ids_flat):
-            rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
-                [corner], self._length, K, D
-            )
-            if rvec is None:
+            pose = self._estimate_pose_single_marker(corner, K, D)
+            if pose is None:
                 continue
-            rvec = rvec[0, 0]
-            tvec = tvec[0, 0]
-            z = float(tvec[2])
+            rvec, tvec = pose
+            z = float(tvec.reshape(3)[2])
             if z < best_z:
                 best_z = z
                 R, _ = cv2.Rodrigues(rvec)
                 T = np.eye(4, dtype=np.float64)
                 T[:3, :3] = R
-                T[:3,  3] = tvec
-                best = MarkerPose(id=int(mid), T_marker2cam=T)
+                T[:3,  3] = tvec.reshape(3)
+                best = MarkerPose(
+                    id=int(mid),
+                    T_marker2cam=T,
+                    corners_px=np.asarray(corner, dtype=np.float64).reshape(4, 2),
+                )
 
         return best
 
@@ -114,11 +177,31 @@ class ArUcoDetector:
 
         cv2.aruco.drawDetectedMarkers(vis, corners, ids)
 
-        for corner in corners:
-            rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
-                [corner], self._length, K, D
+        ids_flat = ids.flatten()
+        for corner, mid in zip(corners, ids_flat):
+            pts = np.asarray(corner, dtype=np.float64).reshape(4, 2)
+            x1, y1 = np.min(pts, axis=0)
+            x2, y2 = np.max(pts, axis=0)
+            cv2.rectangle(
+                vis,
+                (int(round(x1)), int(round(y1))),
+                (int(round(x2)), int(round(y2))),
+                (0, 255, 255),
+                2,
             )
-            if rvec is not None:
-                cv2.drawFrameAxes(vis, K, D, rvec[0], tvec[0], axis_length)
+            cv2.putText(
+                vis,
+                f"id={int(mid)} bbox=({int(x1)},{int(y1)},{int(x2)},{int(y2)})",
+                (int(round(x1)), max(18, int(round(y1)) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            pose = self._estimate_pose_single_marker(corner, K, D)
+            if pose is not None:
+                rvec, tvec = pose
+                cv2.drawFrameAxes(vis, K, D, rvec, tvec, axis_length)
 
         return vis

@@ -44,4 +44,3 @@ print("[OK] import pyorbbecsdk:", pyorbbecsdk.__file__)
 PY
 
 echo "[OK] pyorbbecsdk install check passed"
-

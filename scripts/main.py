@@ -20,7 +20,6 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 for _p in (PROJECT_ROOT,):
     _s = str(_p)
@@ -42,24 +41,6 @@ from utils.yolo_runtime import (
     resolve_yolo_model_path,
     yolo_predict_kwargs,
 )
-
-
-def load_config(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Config not found: {path}")
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def load_hand_eye(project_root: Path, cam_type: str) -> tuple[Optional[np.ndarray], Optional[str]]:
-    hand_eye_path = project_root / "config" / "calibration" / cam_type / "hand_eye.npz"
-    if not hand_eye_path.exists():
-        return None, None
-
-    data = np.load(str(hand_eye_path), allow_pickle=False)
-    T = data["T_result"].astype(np.float64)
-    mode = str(data["mode"][0])
-    return T, mode
 from utils.yolo_utils import load_yolo
 
 
@@ -210,24 +191,22 @@ def main() -> int:
     yolo_cfg = cfg.get("yolo", {})
     gp_cfg = cfg.get("grasp_pipeline", {})
     grasp_cfg = gp_cfg.get("grasp", {})
+    det_cfg = cfg.get("detection", {})
 
-    model_name = yolo_cfg.get("model_name", "yolo11n-seg.engine")
-    yolo_device = yolo_cfg.get("device", "auto")
+    print(f"=== 加载 YOLO ===")
+    model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
     conf = float(det_cfg.get("conf_threshold", 0.25))
     iou = float(det_cfg.get("iou_threshold", 0.45))
-    model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
+    predict_kwargs = yolo_predict_kwargs(
+        yolo_opts.get("model_name", "yolo11n-seg.engine"),
+        yolo_opts.get("device", "cpu"),
+        conf,
+        iou,
+    )
+
     pregrasp_offset_m = float(grasp_cfg.get("pregrasp_offset_m", 0.08))
     depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
     infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
-
-    print(f"=== 加载 YOLO: {model_name} ===")
-    model_path = resolve_yolo_model_path(PROJECT_ROOT, model_name)
-    ensure_jetson_tensorrt_importable()
-    model = YOLO(str(model_path))
-    if yolo_cfg.get("use_world", False) and is_open_vocab_model(model_name):
-        model.set_classes(list(yolo_cfg.get("custom_classes", [])))
-    predict_kwargs = yolo_predict_kwargs(model_name, yolo_device, conf, iou)
-    model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
 
     last_results: list[Any] = []
     last_grasps: list[GraspPose] = []
@@ -257,7 +236,6 @@ def main() -> int:
                 fps_timer = now
 
             if not frozen and (frame_index % infer_every == 0 or not last_results):
-                last_results = model.predict(color_bgr, **predict_kwargs)
                 last_results = model.predict(
                     color_bgr,
                     verbose=False,
@@ -293,7 +271,6 @@ def main() -> int:
                     print("[G] 采帧失败")
                     continue
 
-                snap_results = model.predict(snap_color, **predict_kwargs)
                 snap_results = model.predict(
                     snap_color,
                     verbose=False,

@@ -502,6 +502,130 @@ class RebotArm:
         T[:3,  3] = position
         return T
 
+    def get_joint_positions(self) -> np.ndarray:
+        """读取当前 6 个关节角，单位 rad。"""
+        return self._arm.get_positions(request=True)
+
+    def _joint_index(self, joint_name: str) -> int:
+        names = list(self._arm.joint_names)
+        if joint_name not in names:
+            raise ValueError(f"unknown joint {joint_name!r}; available joints: {names}")
+        return names.index(joint_name)
+
+    def _joint_limit(self, joint_name: str) -> tuple[float, float]:
+        joint_id = self._model.getJointId(joint_name)
+        if joint_id < 0:
+            raise ValueError(f"unknown joint in model: {joint_name!r}")
+        idx_q = int(self._model.joints[joint_id].idx_q)
+        if idx_q < 0:
+            raise ValueError(f"joint is fixed in model: {joint_name!r}")
+        lo = float(self._model.lowerPositionLimit[idx_q])
+        hi = float(self._model.upperPositionLimit[idx_q])
+        return lo, hi
+
+    def rotate_base_relative(
+        self,
+        delta_rad: float,
+        duration: float = 2.5,
+        direction: str = "auto",
+        safety_margin_rad: float = 0.08,
+        joint_name: str = "joint1",
+    ) -> bool:
+        """相对转动底座关节，带限位保护。
+
+        direction:
+            auto     根据当前角度和限位选择更安全的方向
+            positive 强制正方向
+            negative 强制负方向
+        """
+        if self._endpos_ctrl is None:
+            raise RuntimeError("未连接机械臂，请先调用 connect()")
+
+        idx = self._joint_index(joint_name)
+        lo, hi = self._joint_limit(joint_name)
+        lo_safe = lo + float(safety_margin_rad)
+        hi_safe = hi - float(safety_margin_rad)
+        if lo_safe >= hi_safe:
+            raise ValueError(f"{joint_name} safety margin too large for limits [{lo:.3f}, {hi:.3f}]")
+
+        q_now = self.get_joint_positions()
+        current = float(q_now[idx])
+        delta_abs = abs(float(delta_rad))
+        if delta_abs <= 1e-6:
+            return True
+
+        direction = str(direction).strip().lower()
+        if direction in ("+", "positive", "pos", "ccw"):
+            signs = [1.0]
+        elif direction in ("-", "negative", "neg", "cw"):
+            signs = [-1.0]
+        elif direction == "auto":
+            candidates = []
+            for sign in (1.0, -1.0):
+                target = current + sign * delta_abs
+                if lo_safe <= target <= hi_safe:
+                    margin = min(target - lo_safe, hi_safe - target)
+                    candidates.append((margin, sign, target))
+            if not candidates:
+                print(
+                    f"[Place] {joint_name} cannot move +/-{np.degrees(delta_abs):.1f}deg safely: "
+                    f"current={current:+.3f} rad limit=[{lo_safe:+.3f},{hi_safe:+.3f}]"
+                )
+                return False
+            candidates.sort(reverse=True)
+            signs = [candidates[0][1]]
+        else:
+            raise ValueError("direction must be auto, positive, or negative")
+
+        target = current + signs[0] * delta_abs
+        if target < lo_safe or target > hi_safe:
+            print(
+                f"[Place] blocked {joint_name} move: current={current:+.3f} rad "
+                f"target={target:+.3f} rad safe_limit=[{lo_safe:+.3f},{hi_safe:+.3f}]"
+            )
+            return False
+
+        q_target = q_now.copy()
+        q_target[idx] = target
+        vlim = np.array([j.vlim for j in self._arm._joints], dtype=np.float64)
+        vlim[idx] = max(delta_abs / max(float(duration), 0.2), 0.05)
+
+        print(
+            f"[Place] rotate {joint_name}: {np.degrees(current):+.1f}deg -> "
+            f"{np.degrees(target):+.1f}deg"
+        )
+
+        ctrl = self._endpos_ctrl
+        ctrl._stop_send.set()
+        if ctrl._send_thread is not None:
+            ctrl._send_thread.join(timeout=2.0)
+        ctrl._stop_send.clear()
+
+        ctrl._vlim_override = vlim
+        duration_s = max(float(duration), 0.2)
+        update_hz = 100.0
+        total_steps = max(int(duration_s * update_hz), 20)
+        interval = 1.0 / update_hz
+        deadline = time.monotonic() + max(float(duration), 0.2) + 3.0
+        try:
+            for step in range(1, total_steps + 1):
+                t = step / total_steps
+                alpha = 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
+                ctrl._q_target[:] = (1.0 - alpha) * q_now + alpha * q_target
+                time.sleep(interval)
+            ctrl._q_target[:] = q_target
+
+            while time.monotonic() < deadline:
+                q_check = self._arm.get_positions(request=True)
+                if abs(float(q_check[idx]) - target) < 0.03:
+                    return True
+                time.sleep(0.05)
+            print(f"[Place] {joint_name} rotation timeout")
+            return False
+        finally:
+            ctrl._vlim_override = None
+            ctrl._stop_send.clear()
+
     # ── 运动控制 ──────────────────────────────────────────────────────────────
 
     def check_ik(
@@ -554,7 +678,30 @@ class RebotArm:
         """回零位（关节全部归零）。"""
         if self._endpos_ctrl is None:
             raise RuntimeError("未连接机械臂，请先调用 connect()")
-        self._endpos_ctrl.safe_home()
+        ctrl = self._endpos_ctrl
+        ctrl._stop_send.set()
+        if ctrl._send_thread is not None:
+            ctrl._send_thread.join(timeout=2.0)
+        ctrl._stop_send.clear()
+
+        q_now = self.get_joint_positions()
+        max_delta = float(np.max(np.abs(q_now))) if q_now.size else 0.0
+        duration_s = max(float(duration), 0.2)
+        home_vlim = float(np.clip(max(max_delta / duration_s, 0.3), 0.3, 0.8))
+        ctrl._vlim_override = np.full(self._arm.num_joints, home_vlim, dtype=np.float64)
+        ctrl._q_target[:] = 0.0
+
+        deadline = time.monotonic() + max(max_delta / home_vlim + 3.0, duration_s + 3.0, 6.0)
+        try:
+            while time.monotonic() < deadline:
+                q_check = self._arm.get_positions(request=True)
+                if q_check.size and float(np.max(np.abs(q_check))) < 0.03:
+                    return
+                time.sleep(0.05)
+            print("[RebotArm] safe_home timeout")
+        finally:
+            ctrl._vlim_override = None
+            ctrl._stop_send.clear()
 
     # ── 上下文管理器 ──────────────────────────────────────────────────────────
 

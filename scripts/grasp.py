@@ -10,6 +10,7 @@ grasp.py - 基于 GraspNet 的机械臂视觉夹取主程序
 
 用法：
   conda activate seeed
+  cd /home/seeed/Downloads/rebot_grasp
   python scripts/grasp.py --dry-run
   python scripts/grasp.py --target-class cup
 """
@@ -25,6 +26,7 @@ from typing import Any, Optional
 
 import cv2
 import numpy as np
+import yaml
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
@@ -32,10 +34,11 @@ os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SEEED_ROOT = PROJECT_ROOT.parent
 GRASPNET_ROOT = PROJECT_ROOT / "sdk" / "graspnet-baseline"
+GRASPNET_API_ROOT = PROJECT_ROOT / "sdk" / "graspnetAPI"
 
 
 def _prepare_imports() -> None:
-    for path in (SEEED_ROOT, PROJECT_ROOT):
+    for path in (SEEED_ROOT, PROJECT_ROOT, GRASPNET_API_ROOT):
         path_str = str(path)
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
@@ -64,6 +67,43 @@ from cameraws.utils.yolo_utils import (  # noqa: E402
 from graspnetAPI import Grasp, GraspGroup  # noqa: E402
 
 
+def build_place_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    place_cfg = dict(cfg.get("grasp_pipeline", {}).get("place", {}))
+    place_cfg.setdefault("enabled", True)
+    place_cfg.setdefault("base_joint", "joint1")
+    place_cfg.setdefault("base_delta_deg", 90.0)
+    place_cfg.setdefault("base_direction", "auto")
+    place_cfg.setdefault("base_rotate_duration", 2.5)
+    place_cfg.setdefault("base_safety_margin_deg", 5.0)
+    place_cfg.setdefault("return_home", True)
+
+    cfg_delta = float(place_cfg.get("base_delta_deg", 90.0))
+    if cfg_delta < 0.0 and str(place_cfg.get("base_direction", "auto")).lower() == "auto":
+        place_cfg["base_direction"] = "negative"
+    place_cfg["base_delta_deg"] = abs(cfg_delta)
+
+    if getattr(args, "no_place_after_grasp", False):
+        place_cfg["enabled"] = False
+    delta_arg = getattr(args, "place_base_delta_deg", None)
+    direction_arg = getattr(args, "place_base_direction", None)
+    if delta_arg is not None:
+        delta = float(delta_arg)
+        place_cfg["base_delta_deg"] = abs(delta)
+        if direction_arg is None and delta < 0.0:
+            place_cfg["base_direction"] = "negative"
+        elif direction_arg is None and delta > 0.0 and str(place_cfg.get("base_direction", "auto")).lower() == "auto":
+            place_cfg["base_direction"] = "positive"
+    if direction_arg is not None:
+        place_cfg["base_direction"] = str(direction_arg)
+    if getattr(args, "place_base_rotate_duration", None) is not None:
+        place_cfg["base_rotate_duration"] = float(args.place_base_rotate_duration)
+    if getattr(args, "place_base_safety_margin_deg", None) is not None:
+        place_cfg["base_safety_margin_deg"] = float(args.place_base_safety_margin_deg)
+    if getattr(args, "no_home_after_place", False):
+        place_cfg["return_home"] = False
+    return place_cfg
+
+
 def _move_ready(robot: RebotArm, ready_cfg: dict[str, Any]) -> None:
     duration = float(ready_cfg.get("duration", 3.0))
     robot.move_to(
@@ -77,6 +117,129 @@ def _move_ready(robot: RebotArm, ready_cfg: dict[str, Any]) -> None:
     )
     robot.wait_motion(duration)
 
+
+def _rpy_offset_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    rx_mat = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+    ry_mat = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+    rz_mat = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rz_mat @ ry_mat @ rx_mat
+
+
+def _pose_offset_matrix(
+    x_m: float = 0.0,
+    y_m: float = 0.0,
+    z_m: float = 0.0,
+    roll_rad: float = 0.0,
+    pitch_rad: float = 0.0,
+    yaw_rad: float = 0.0,
+) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = _rpy_offset_matrix(float(roll_rad), float(pitch_rad), float(yaw_rad))
+    T[:3, 3] = [float(x_m), float(y_m), float(z_m)]
+    return T
+
+
+def _has_nonzero_offset(*values: float) -> bool:
+    return any(abs(float(value)) > 1e-9 for value in values)
+
+
+def _transform_grasp(
+    grasp: Grasp,
+    T_cam2base: np.ndarray,
+    pregrasp_offset_m: float,
+    retreat_offset_m: float,
+    forward_offset_m: float = 0.0,
+    lateral_offset_m: float = 0.0,
+    vertical_offset_m: float = 0.0,
+    roll_offset_rad: float = 0.0,
+    pitch_offset_rad: float = 0.0,
+    yaw_offset_rad: float = 0.0,
+    camera_x_offset_m: float = 0.0,
+    camera_y_offset_m: float = 0.0,
+    camera_z_offset_m: float = 0.0,
+    camera_roll_offset_rad: float = 0.0,
+    camera_pitch_offset_rad: float = 0.0,
+    camera_yaw_offset_rad: float = 0.0,
+    base_x_offset_m: float = 0.0,
+    base_y_offset_m: float = 0.0,
+    base_z_offset_m: float = 0.0,
+    base_roll_offset_rad: float = 0.0,
+    base_pitch_offset_rad: float = 0.0,
+    base_yaw_offset_rad: float = 0.0,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    T_grasp_cam = np.eye(4, dtype=np.float64)
+    T_grasp_cam[:3, :3] = graspnet_rotation_to_rebot_tcp_rotation(grasp.rotation_matrix)
+    T_grasp_cam[:3, 3] = np.asarray(grasp.translation, dtype=np.float64)
+
+    T_cam2base_effective = np.asarray(T_cam2base, dtype=np.float64).copy()
+    if _has_nonzero_offset(
+        camera_x_offset_m,
+        camera_y_offset_m,
+        camera_z_offset_m,
+        camera_roll_offset_rad,
+        camera_pitch_offset_rad,
+        camera_yaw_offset_rad,
+    ):
+        T_cam2base_effective = T_cam2base_effective @ _pose_offset_matrix(
+            camera_x_offset_m,
+            camera_y_offset_m,
+            camera_z_offset_m,
+            camera_roll_offset_rad,
+            camera_pitch_offset_rad,
+            camera_yaw_offset_rad,
+        )
+    if _has_nonzero_offset(
+        base_x_offset_m,
+        base_y_offset_m,
+        base_z_offset_m,
+        base_roll_offset_rad,
+        base_pitch_offset_rad,
+        base_yaw_offset_rad,
+    ):
+        T_cam2base_effective = _pose_offset_matrix(
+            base_x_offset_m,
+            base_y_offset_m,
+            base_z_offset_m,
+            base_roll_offset_rad,
+            base_pitch_offset_rad,
+            base_yaw_offset_rad,
+        ) @ T_cam2base_effective
+
+    T_grasp_base = T_cam2base_effective @ T_grasp_cam
+    grasp_rot_base = canonicalize_parallel_gripper_tcp_rotation(T_grasp_base[:3, :3])
+    if _has_nonzero_offset(roll_offset_rad, pitch_offset_rad, yaw_offset_rad):
+        grasp_rot_base = canonicalize_parallel_gripper_tcp_rotation(
+            grasp_rot_base @ _rpy_offset_matrix(roll_offset_rad, pitch_offset_rad, yaw_offset_rad)
+        )
+
+    grasp_pos_base = T_grasp_base[:3, 3].copy()
+    local_offset = np.array(
+        [float(forward_offset_m), float(lateral_offset_m), float(vertical_offset_m)],
+        dtype=np.float64,
+    )
+    grasp_pos_base = grasp_pos_base + grasp_rot_base @ local_offset
+    T_grasp_base[:3, 3] = grasp_pos_base
+    T_grasp_base[:3, :3] = grasp_rot_base
+
+    T_pregrasp_base = T_grasp_base.copy()
+    T_pregrasp_base[:3, 3] = grasp_pos_base - grasp_rot_base[:, 0] * float(pregrasp_offset_m)
+
+    T_retreat_base = T_grasp_base.copy()
+    T_retreat_base[:3, 3] = grasp_pos_base - grasp_rot_base[:, 0] * float(retreat_offset_m)
+
+    def mat4_to_pose6d(T_mat: np.ndarray) -> tuple[float, ...]:
+        euler = rotation_matrix_to_euler_zyx(T_mat[:3, :3])
+        return (
+            float(T_mat[0, 3]), float(T_mat[1, 3]), float(T_mat[2, 3]),
+            float(euler[0]), float(euler[1]), float(euler[2]),
+        )
+
+    return mat4_to_pose6d(T_grasp_base), mat4_to_pose6d(T_pregrasp_base), mat4_to_pose6d(T_retreat_base)
+
+
 def _execute_grasp(
     robot: RebotArm,
     grasp6d: tuple[float, ...],
@@ -84,6 +247,8 @@ def _execute_grasp(
     retreat6d: tuple[float, ...],
     ready_cfg: dict[str, Any],
     dry_run: bool,
+    gripper_width_m: float,
+    place_cfg: dict[str, Any] | None = None,
 ) -> bool:
     xg, yg, zg, rxg, ryg, rzg = grasp6d
     xp, yp, zp, rxp, ryp, rzp = pre6d
@@ -97,8 +262,8 @@ def _execute_grasp(
         print("[Grasp] --dry-run: 跳过机械臂执行")
         return False
 
-    print("[Grasp] 打开夹爪...")
-    robot.open_gripper()
+    print(f"[Grasp] 打开夹爪 width={gripper_width_m:.3f}m...")
+    robot.open_gripper(distance_m=gripper_width_m)
 
     print("[Grasp] 移动到预夹取位...")
     if not robot.move_to(xp, yp, zp, rxp, ryp, rzp, duration=2.0):
@@ -120,73 +285,54 @@ def _execute_grasp(
     if robot.move_to(xr, yr, zr, rxr, ryr, rzr, duration=1.5):
         robot.wait_motion(1.5)
 
+    place_cfg = place_cfg or {}
+    place_enabled = bool(place_cfg.get("enabled", True))
+    if ok and place_enabled:
+        base_delta_deg = float(place_cfg.get("base_delta_deg", 90.0))
+        base_direction = str(place_cfg.get("base_direction", "auto"))
+        base_duration = float(place_cfg.get("base_rotate_duration", 2.5))
+        base_margin_deg = float(place_cfg.get("base_safety_margin_deg", 5.0))
+        base_joint = str(place_cfg.get("base_joint", "joint1"))
+
+        print(
+            f"[Place] 夹取成功，准备转动 {base_joint} {base_delta_deg:.1f}deg "
+            f"direction={base_direction}"
+        )
+        place_ok = robot.rotate_base_relative(
+            np.radians(base_delta_deg),
+            duration=base_duration,
+            direction=base_direction,
+            safety_margin_rad=np.radians(base_margin_deg),
+            joint_name=base_joint,
+        )
+        if not place_ok:
+            print("[Place] 底座转动未完成或被限位保护拦截，将在当前位置松爪并回零")
+
+        print("[Place] 松开夹爪，放下物体...")
+        robot.release_gripper()
+
+        if bool(place_cfg.get("return_home", True)):
+            print("[Place] 放置完成，机械臂回零位...")
+            robot.safe_home()
+        else:
+            print("[Place] 放置完成，机械臂返回预备位...")
+            _move_ready(robot, ready_cfg)
+        return bool(place_ok)
+
     print("[Grasp] 返回预备位...")
     _move_ready(robot, ready_cfg)
     return ok
 
 
 def _print_grasp(grasp: Grasp) -> None:
-    tcp_rotation = canonicalize_parallel_gripper_tcp_rotation(graspnet_rotation_to_rebot_tcp_rotation(grasp.rotation_matrix))
+    tcp_rotation = canonicalize_parallel_gripper_tcp_rotation(
+        graspnet_rotation_to_rebot_tcp_rotation(grasp.rotation_matrix)
+    )
     print("\n[G] GraspNet 最佳夹取:")
     print(f"  score={grasp.score:.4f} width={grasp.width:.4f} height={grasp.height:.4f} depth={grasp.depth:.4f}")
     print(f"  position_xyz={grasp.translation.tolist()}")
     print(f"  graspnet_rpy={rotation_matrix_to_euler_zyx(grasp.rotation_matrix).tolist()}")
     print(f"  tcp_rpy={rotation_matrix_to_euler_zyx(tcp_rotation).tolist()}")
-
-
-def _rank_grasps(grasps: GraspGroup) -> GraspGroup:
-    ranked = GraspGroup(grasps.grasp_group_array.copy())
-    try:
-        ranked = ranked.nms()
-    except Exception as exc:
-        print(f"[WARN] GraspNet NMS skipped: {exc}")
-    ranked.sort_by_score()
-    return ranked
-
-
-def _pose_z_ok(pose6d: tuple[float, ...], min_z: float) -> bool:
-    return float(pose6d[2]) >= float(min_z)
-
-
-def _select_executable_grasp(
-    robot: RebotArm,
-    grasps: GraspGroup,
-    T_cam2base: np.ndarray,
-    pregrasp_offset_m: float,
-    retreat_offset_m: float,
-    insertion_depth_m: float,
-    min_base_z_m: float,
-) -> Optional[tuple[Grasp, tuple[float, ...], tuple[float, ...], tuple[float, ...]]]:
-    ranked = _rank_grasps(grasps)
-    skipped_low = 0
-    skipped_ik = 0
-    worst_err = 0.0
-
-    for idx in range(len(ranked)):
-        grasp = ranked[idx]
-        grasp6d, pre6d, retreat6d = graspnet_utils.grasp_to_base_poses(
-            grasp,
-            T_cam2base,
-            pregrasp_offset_m,
-            retreat_offset_m,
-            insertion_depth_m,
-        )
-        if not (_pose_z_ok(pre6d, min_base_z_m) and _pose_z_ok(grasp6d, min_base_z_m)):
-            skipped_low += 1
-            continue
-
-        pre_ok, pre_err = robot.check_ik(*pre6d)
-        grasp_ok, grasp_err = robot.check_ik(*grasp6d) if pre_ok else (False, pre_err)
-        worst_err = max(worst_err, pre_err, grasp_err)
-        if pre_ok and grasp_ok:
-            print(f"[G] 选择可执行候选 rank={idx + 1}/{len(ranked)} score={grasp.score:.4f}")
-            if skipped_low or skipped_ik:
-                print(f"[G] 跳过低高度={skipped_low} IK不可达={skipped_ik}")
-            return grasp, grasp6d, pre6d, retreat6d
-        skipped_ik += 1
-
-    print(f"[G] 没有 IK 可达候选：低高度={skipped_low} IK不可达={skipped_ik} max_err={worst_err:.4f}")
-    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -224,6 +370,31 @@ def parse_args() -> argparse.Namespace:
         default="final",
         help="Open3D 显示的候选集合：final=最终可执行候选，bbox=宽度过滤前，pre-bbox=bbox过滤前",
     )
+    parser.add_argument("--gripper-open-width", type=float, default=0.09, help="meters")
+    parser.add_argument("--grasp-forward-offset", type=float, default=None, help="meters; move final grasp farther along approach axis")
+    parser.add_argument("--grasp-lateral-offset", type=float, default=None, help="meters; move final grasp along local jaw axis")
+    parser.add_argument("--grasp-vertical-offset", type=float, default=None, help="meters; move final grasp along local vertical axis")
+    parser.add_argument("--grasp-roll-offset-deg", type=float, default=None, help="degrees; local TCP X-axis rotation offset")
+    parser.add_argument("--grasp-pitch-offset-deg", type=float, default=None, help="degrees; local TCP Y-axis rotation offset")
+    parser.add_argument("--grasp-yaw-offset-deg", type=float, default=None, help="degrees; local TCP Z-axis rotation offset")
+    parser.add_argument("--camera-x-offset", type=float, default=None, help="meters; extrinsic correction along camera X")
+    parser.add_argument("--camera-y-offset", type=float, default=None, help="meters; extrinsic correction along camera Y")
+    parser.add_argument("--camera-z-offset", type=float, default=None, help="meters; extrinsic correction along camera Z")
+    parser.add_argument("--camera-roll-offset-deg", type=float, default=None, help="degrees; extrinsic correction around camera X")
+    parser.add_argument("--camera-pitch-offset-deg", type=float, default=None, help="degrees; extrinsic correction around camera Y")
+    parser.add_argument("--camera-yaw-offset-deg", type=float, default=None, help="degrees; extrinsic correction around camera Z")
+    parser.add_argument("--base-x-offset", type=float, default=None, help="meters; extrinsic correction along robot base X")
+    parser.add_argument("--base-y-offset", type=float, default=None, help="meters; extrinsic correction along robot base Y")
+    parser.add_argument("--base-z-offset", type=float, default=None, help="meters; extrinsic correction along robot base Z")
+    parser.add_argument("--base-roll-offset-deg", type=float, default=None, help="degrees; extrinsic correction around robot base X")
+    parser.add_argument("--base-pitch-offset-deg", type=float, default=None, help="degrees; extrinsic correction around robot base Y")
+    parser.add_argument("--base-yaw-offset-deg", type=float, default=None, help="degrees; extrinsic correction around robot base Z")
+    parser.add_argument("--no-place-after-grasp", action="store_true", help="disable base-rotate/place/home sequence after successful grasp")
+    parser.add_argument("--place-base-delta-deg", type=float, default=None, help="degrees; base joint relative rotation after successful grasp")
+    parser.add_argument("--place-base-direction", choices=("auto", "positive", "negative"), default=None, help="base joint rotation direction")
+    parser.add_argument("--place-base-rotate-duration", type=float, default=None, help="seconds; base joint rotation duration")
+    parser.add_argument("--place-base-safety-margin-deg", type=float, default=None, help="degrees; keep base target away from joint limits")
+    parser.add_argument("--no-home-after-place", action="store_true", help="return ready pose instead of joint-zero home after placing")
     return parser.parse_args()
 
 
@@ -247,6 +418,25 @@ def main() -> int:
         if args.target_expand_ratio is not None
         else graspnet_cfg.get("target_expand_ratio", 1.0)
     )
+    forward_offset_m = float(args.grasp_forward_offset if args.grasp_forward_offset is not None else grasp_cfg.get("grasp_forward_offset_m", 0.0))
+    lateral_offset_m = float(args.grasp_lateral_offset if args.grasp_lateral_offset is not None else grasp_cfg.get("grasp_lateral_offset_m", 0.0))
+    vertical_offset_m = float(args.grasp_vertical_offset if args.grasp_vertical_offset is not None else grasp_cfg.get("grasp_vertical_offset_m", 0.0))
+    roll_offset_rad = np.radians(float(args.grasp_roll_offset_deg if args.grasp_roll_offset_deg is not None else grasp_cfg.get("grasp_roll_offset_deg", 0.0)))
+    pitch_offset_rad = np.radians(float(args.grasp_pitch_offset_deg if args.grasp_pitch_offset_deg is not None else grasp_cfg.get("grasp_pitch_offset_deg", 0.0)))
+    yaw_offset_rad = np.radians(float(args.grasp_yaw_offset_deg if args.grasp_yaw_offset_deg is not None else grasp_cfg.get("grasp_yaw_offset_deg", 0.0)))
+    camera_x_offset_m = float(args.camera_x_offset if args.camera_x_offset is not None else grasp_cfg.get("camera_x_offset_m", 0.0))
+    camera_y_offset_m = float(args.camera_y_offset if args.camera_y_offset is not None else grasp_cfg.get("camera_y_offset_m", 0.0))
+    camera_z_offset_m = float(args.camera_z_offset if args.camera_z_offset is not None else grasp_cfg.get("camera_z_offset_m", 0.0))
+    camera_roll_offset_rad = np.radians(float(args.camera_roll_offset_deg if args.camera_roll_offset_deg is not None else grasp_cfg.get("camera_roll_offset_deg", 0.0)))
+    camera_pitch_offset_rad = np.radians(float(args.camera_pitch_offset_deg if args.camera_pitch_offset_deg is not None else grasp_cfg.get("camera_pitch_offset_deg", 0.0)))
+    camera_yaw_offset_rad = np.radians(float(args.camera_yaw_offset_deg if args.camera_yaw_offset_deg is not None else grasp_cfg.get("camera_yaw_offset_deg", 0.0)))
+    base_x_offset_m = float(args.base_x_offset if args.base_x_offset is not None else grasp_cfg.get("base_x_offset_m", 0.0))
+    base_y_offset_m = float(args.base_y_offset if args.base_y_offset is not None else grasp_cfg.get("base_y_offset_m", 0.0))
+    base_z_offset_m = float(args.base_z_offset if args.base_z_offset is not None else grasp_cfg.get("base_z_offset_m", 0.0))
+    base_roll_offset_rad = np.radians(float(args.base_roll_offset_deg if args.base_roll_offset_deg is not None else grasp_cfg.get("base_roll_offset_deg", 0.0)))
+    base_pitch_offset_rad = np.radians(float(args.base_pitch_offset_deg if args.base_pitch_offset_deg is not None else grasp_cfg.get("base_pitch_offset_deg", 0.0)))
+    base_yaw_offset_rad = np.radians(float(args.base_yaw_offset_deg if args.base_yaw_offset_deg is not None else grasp_cfg.get("base_yaw_offset_deg", 0.0)))
+    place_cfg = build_place_config(cfg, args)
 
     print("=== 初始化机械臂 ===")
     robot = RebotArm(
@@ -284,7 +474,7 @@ def main() -> int:
     cam = make_camera(cfg)
 
     last_detections: list[YoloDetection] = []
-    selected_target: Optional[Any] = None
+    selected_target: Optional[YoloDetection] = None
     last_target_status = "YOLO disabled: full-scene GraspNet" if yolo_model is None else "target detector warming up..."
     status = "warming up camera..."
     frozen = False
@@ -296,6 +486,7 @@ def main() -> int:
     window_name = "Main - GraspNet Grasp"
     top_k = int(cfg.get("graspnet", {}).get("top_k", 50))
     vis: Optional[graspnet_utils.Open3DGraspWindow] = None
+    last_best_grasp: Optional[Grasp] = None
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, int(cam_cfg.get("color_width", 1280)), int(cam_cfg.get("color_height", 720)))
@@ -353,6 +544,7 @@ def main() -> int:
             if key in (ord("r"), ord("R")):
                 frozen = False
                 last_display = None
+                last_best_grasp = None
                 status = "live preview"
                 continue
 
@@ -394,11 +586,10 @@ def main() -> int:
                 last_target_status = result.target_status
                 last_detections = result.detections
                 selected_target = result.selected_target
-                vis_grasps = graspnet_utils.visualization_grasps(result, args.open3d_grasps)
 
-                print(f"[G] {status}")
                 if not args.no_open3d:
                     try:
+                        vis_grasps = graspnet_utils.visualization_grasps(result, args.open3d_grasps)
                         if vis is None:
                             vis = graspnet_utils.Open3DGraspWindow("GraspNet Grasps", top_k)
                         vis.update(result.o3d_cloud, vis_grasps)
@@ -409,9 +600,11 @@ def main() -> int:
                             vis.close()
                             vis = None
 
+                print(f"[G] {status}")
                 if result.best is None:
                     print("[G] 未找到有效 GraspNet 夹取候选")
                     continue
+
                 frozen = True
                 display_base = snap_color
                 if yolo_model is not None:
@@ -423,33 +616,74 @@ def main() -> int:
                     frozen=True,
                     title="Main - GraspNet Grasp",
                 )
+                graspnet_utils.draw_best_grasp_projection(snap_display, result.best, K)
                 last_display = snap_display
+                last_best_grasp = result.best
 
                 if T_hand_eye is None:
-                    graspnet_utils.draw_best_grasp_projection(snap_display, result.best, K)
-                    last_display = snap_display
                     print("[G] 手眼标定不可用，无法执行夹取")
                     continue
 
                 T_cam2base = robot.get_tcp_pose() @ T_hand_eye
-                selected = _select_executable_grasp(
-                    robot,
-                    result.grasps,
-                    T_cam2base,
-                    pregrasp_offset_m,
-                    retreat_offset_m,
-                    insertion_depth_m,
-                    min_base_z_m,
-                )
+
+                grasps_to_check = result.grasps
+                selected = None
+                ranked = graspnet_utils.rank_grasps(grasps_to_check)
+                skipped_low = 0
+                skipped_ik = 0
+                worst_err = 0.0
+
+                for idx in range(len(ranked)):
+                    grasp = ranked[idx]
+                    grasp6d, pre6d, retreat6d = _transform_grasp(
+                        grasp,
+                        T_cam2base,
+                        pregrasp_offset_m,
+                        retreat_offset_m,
+                        forward_offset_m=forward_offset_m,
+                        lateral_offset_m=lateral_offset_m,
+                        vertical_offset_m=vertical_offset_m,
+                        roll_offset_rad=roll_offset_rad,
+                        pitch_offset_rad=pitch_offset_rad,
+                        yaw_offset_rad=yaw_offset_rad,
+                        camera_x_offset_m=camera_x_offset_m,
+                        camera_y_offset_m=camera_y_offset_m,
+                        camera_z_offset_m=camera_z_offset_m,
+                        camera_roll_offset_rad=camera_roll_offset_rad,
+                        camera_pitch_offset_rad=camera_pitch_offset_rad,
+                        camera_yaw_offset_rad=camera_yaw_offset_rad,
+                        base_x_offset_m=base_x_offset_m,
+                        base_y_offset_m=base_y_offset_m,
+                        base_z_offset_m=base_z_offset_m,
+                        base_roll_offset_rad=base_roll_offset_rad,
+                        base_pitch_offset_rad=base_pitch_offset_rad,
+                        base_yaw_offset_rad=base_yaw_offset_rad,
+                    )
+
+                    z_ok = float(pre6d[2]) >= float(min_base_z_m) and float(grasp6d[2]) >= float(min_base_z_m)
+                    if not z_ok:
+                        skipped_low += 1
+                        continue
+
+                    pre_ok, pre_err = robot.check_ik(*pre6d)
+                    grasp_ok, grasp_err = robot.check_ik(*grasp6d) if pre_ok else (False, pre_err)
+                    worst_err = max(worst_err, pre_err, grasp_err)
+                    if pre_ok and grasp_ok:
+                        print(f"[G] 选择可执行候选 rank={idx + 1}/{len(ranked)} score={grasp.score:.4f}")
+                        if skipped_low or skipped_ik:
+                            print(f"[G] 跳过低高度={skipped_low} IK不可达={skipped_ik}")
+                        selected = grasp, grasp6d, pre6d, retreat6d
+                        break
+                    skipped_ik += 1
+
                 if selected is None:
                     print(f"[G] 没有满足 min_base_z={min_base_z_m:.3f}m 且 IK 可达的夹取候选，跳过执行")
                     continue
+
                 best, grasp6d, pre6d, retreat6d = selected
-
                 _print_grasp(best)
-                graspnet_utils.draw_best_grasp_projection(snap_display, best, K)
-                last_display = snap_display
 
+                gripper_width_m = max(float(args.gripper_open_width), float(best.width) + 0.02)
                 _execute_grasp(
                     robot,
                     grasp6d,
@@ -457,6 +691,8 @@ def main() -> int:
                     retreat6d,
                     ready_cfg,
                     dry_run=args.dry_run,
+                    gripper_width_m=gripper_width_m,
+                    place_cfg=place_cfg,
                 )
 
             if vis is not None and not vis.poll():

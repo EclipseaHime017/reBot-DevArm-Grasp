@@ -1,0 +1,16 @@
+# Non-PyTorch runtime pieces for the GraspNet demos on Jetson/aarch64.
+# Install a JetPack-matched torch/torchvision wheel before this file.
+numpy==1.26.1
+scipy
+tqdm
+Pillow
+ultralytics
+open3d-unofficial-arm; platform_machine == "aarch64"
+open3d; platform_machine != "aarch64"
+transforms3d==0.4.2
+trimesh
+pywavefront
+scikit-image
+h5py
+dill
+grasp_nms
