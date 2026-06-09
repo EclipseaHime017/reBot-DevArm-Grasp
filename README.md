@@ -1,8 +1,8 @@
 # 🦾 reBot Arm B601-DM Visual Grasping Demo (Jetson Edition)
 
 <p align="center">
-  <img src="https://media-cdn.seeedstudio.com/media/catalog/product/cache/bb49d3ec4ee05b6f018e93f896b8a25d/1/1/110110147.jpg" alt="reComputer" width="450">
   <img src="https://raw.githubusercontent.com/Seeed-Projects/reBot-DevArm/main/media/v1.0.png" alt="reBot Arm B601" width="500">
+  <img src="https://media-cdn.seeedstudio.com/media/catalog/product/cache/bb49d3ec4ee05b6f018e93f896b8a25d/1/1/110110147.jpg" alt="reComputer" width="400">
 </p>
 
 <p align="center">
