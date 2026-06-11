@@ -75,6 +75,8 @@ def build_place_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[st
     place_cfg.setdefault("base_direction", "auto")
     place_cfg.setdefault("base_rotate_duration", 2.5)
     place_cfg.setdefault("base_safety_margin_deg", 5.0)
+    place_cfg.setdefault("stow_before_base_rotate", True)
+    place_cfg.setdefault("stow_duration", 2.5)
     place_cfg.setdefault("return_home", True)
 
     cfg_delta = float(place_cfg.get("base_delta_deg", 90.0))
@@ -249,6 +251,7 @@ def _execute_grasp(
     dry_run: bool,
     gripper_width_m: float,
     place_cfg: dict[str, Any] | None = None,
+    ready_joints: np.ndarray | None = None,
 ) -> bool:
     xg, yg, zg, rxg, ryg, rzg = grasp6d
     xp, yp, zp, rxp, ryp, rzp = pre6d
@@ -293,18 +296,37 @@ def _execute_grasp(
         base_duration = float(place_cfg.get("base_rotate_duration", 2.5))
         base_margin_deg = float(place_cfg.get("base_safety_margin_deg", 5.0))
         base_joint = str(place_cfg.get("base_joint", "joint1"))
+        stow_enabled = bool(place_cfg.get("stow_before_base_rotate", True))
+        stow_duration = float(place_cfg.get("stow_duration", 2.5))
 
         print(
-            f"[Place] 夹取成功，准备转动 {base_joint} {base_delta_deg:.1f}deg "
+            f"[Place] 夹取成功，准备收姿态并转动 {base_joint} {base_delta_deg:.1f}deg "
             f"direction={base_direction}"
         )
-        place_ok = robot.rotate_base_relative(
-            np.radians(base_delta_deg),
-            duration=base_duration,
-            direction=base_direction,
-            safety_margin_rad=np.radians(base_margin_deg),
-            joint_name=base_joint,
-        )
+        stow_ok = True
+        if stow_enabled:
+            if ready_joints is None:
+                print("[Place] 缺少启动 ready 关节角，跳过底座转动以避免碰撞")
+                stow_ok = False
+            else:
+                print(f"[Place] 收回非底座关节到启动 ready 姿态，保持 {base_joint} 不动...")
+                stow_ok = robot.move_joints_to(
+                    ready_joints,
+                    duration=stow_duration,
+                    hold_joint_names=(base_joint,),
+                )
+                if not stow_ok:
+                    print("[Place] 收姿态未完成，跳过底座转动以避免碰撞")
+
+        place_ok = False
+        if stow_ok:
+            place_ok = robot.rotate_base_relative(
+                np.radians(base_delta_deg),
+                duration=base_duration,
+                direction=base_direction,
+                safety_margin_rad=np.radians(base_margin_deg),
+                joint_name=base_joint,
+            )
         if not place_ok:
             print("[Place] 底座转动未完成或被限位保护拦截，将在当前位置松爪并回零")
 
@@ -449,6 +471,7 @@ def main() -> int:
 
     print("[Robot] 移动到预备位置...")
     _move_ready(robot, ready_cfg)
+    ready_joints = robot.get_joint_positions().copy()
 
     cam_type = str(cfg.get("camera", {}).get("type", "")).lower()
     T_hand_eye, hand_eye_mode = load_hand_eye(PROJECT_ROOT, cam_type)
@@ -693,6 +716,7 @@ def main() -> int:
                     dry_run=args.dry_run,
                     gripper_width_m=gripper_width_m,
                     place_cfg=place_cfg,
+                    ready_joints=ready_joints,
                 )
 
             if vis is not None and not vis.poll():

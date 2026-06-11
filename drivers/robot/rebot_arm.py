@@ -514,11 +514,13 @@ class RebotArm:
 
     def _joint_limit(self, joint_name: str) -> tuple[float, float]:
         joint_id = self._model.getJointId(joint_name)
-        if joint_id < 0:
+        if joint_id < 0 or joint_id >= len(self._model.joints):
             raise ValueError(f"unknown joint in model: {joint_name!r}")
         idx_q = int(self._model.joints[joint_id].idx_q)
         if idx_q < 0:
             raise ValueError(f"joint is fixed in model: {joint_name!r}")
+        if idx_q >= len(self._model.lowerPositionLimit):
+            raise ValueError(f"joint limit index out of range for model joint: {joint_name!r}")
         lo = float(self._model.lowerPositionLimit[idx_q])
         hi = float(self._model.upperPositionLimit[idx_q])
         return lo, hi
@@ -621,6 +623,85 @@ class RebotArm:
                     return True
                 time.sleep(0.05)
             print(f"[Place] {joint_name} rotation timeout")
+            return False
+        finally:
+            ctrl._vlim_override = None
+            ctrl._stop_send.clear()
+
+    def move_joints_to(
+        self,
+        target_q: np.ndarray,
+        duration: float = 2.5,
+        hold_joint_names: tuple[str, ...] = (),
+        tolerance_rad: float = 0.03,
+    ) -> bool:
+        """Move arm joints to a joint-space target while optionally holding named joints."""
+        if self._endpos_ctrl is None:
+            raise RuntimeError("未连接机械臂，请先调用 connect()")
+
+        q_now = self.get_joint_positions()
+        q_target = np.asarray(target_q, dtype=np.float64).reshape(-1).copy()
+        if q_target.shape != q_now.shape:
+            raise ValueError(f"target_q shape {q_target.shape} does not match current joints {q_now.shape}")
+
+        hold_indices = {self._joint_index(name) for name in hold_joint_names}
+        for idx in hold_indices:
+            q_target[idx] = q_now[idx]
+
+        joint_names = list(self._arm.joint_names)
+        for idx, name in enumerate(joint_names):
+            if idx in hold_indices:
+                continue
+            try:
+                lo, hi = self._joint_limit(name)
+            except ValueError as exc:
+                print(f"[RebotArm] skip joint limit check for {name}: {exc}")
+                continue
+            if not (lo <= float(q_target[idx]) <= hi):
+                print(
+                    f"[RebotArm] blocked joint move: {name} target={q_target[idx]:+.3f} rad "
+                    f"limit=[{lo:+.3f},{hi:+.3f}]"
+                )
+                return False
+
+        delta = np.abs(q_target - q_now)
+        moving = [idx for idx in range(q_now.size) if idx not in hold_indices and float(delta[idx]) > 1e-6]
+        if not moving:
+            return True
+
+        ctrl = self._endpos_ctrl
+        ctrl._stop_send.set()
+        if ctrl._send_thread is not None:
+            ctrl._send_thread.join(timeout=2.0)
+        ctrl._stop_send.clear()
+
+        duration_s = max(float(duration), 0.2)
+        joint_vlim = np.array([j.vlim for j in self._arm._joints], dtype=np.float64)
+        vlim = joint_vlim.copy()
+        for idx in moving:
+            vlim[idx] = float(np.clip(delta[idx] / duration_s, 0.05, joint_vlim[idx]))
+
+        ctrl._vlim_override = vlim
+        update_hz = 100.0
+        total_steps = max(int(duration_s * update_hz), 20)
+        interval = 1.0 / update_hz
+        max_delta = float(np.max(delta[moving])) if moving else 0.0
+        min_vlim = float(max(np.min(vlim[moving]), 0.05)) if moving else 0.05
+        deadline = time.monotonic() + max(max_delta / min_vlim + 3.0, duration_s + 3.0, 6.0)
+        try:
+            for step in range(1, total_steps + 1):
+                t = step / total_steps
+                alpha = 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
+                ctrl._q_target[:] = (1.0 - alpha) * q_now + alpha * q_target
+                time.sleep(interval)
+            ctrl._q_target[:] = q_target
+
+            while time.monotonic() < deadline:
+                q_check = self._arm.get_positions(request=True)
+                if q_check.size and float(np.max(np.abs(q_check[moving] - q_target[moving]))) < tolerance_rad:
+                    return True
+                time.sleep(0.05)
+            print("[RebotArm] move_joints_to timeout")
             return False
         finally:
             ctrl._vlim_override = None

@@ -69,7 +69,7 @@ def select_best_grasp(grasps: list[GraspPose]) -> Optional[GraspPose]:
     return max(valid, key=lambda grasp: grasp.conf)
 
 
-def draw_grasp(image: np.ndarray, grasp: GraspPose) -> None:
+def draw_grasp(image: np.ndarray, grasp: GraspPose, tags: list[str] | None = None) -> None:
     x1, y1, x2, y2 = grasp.bbox_xyxy
     color = (0, 255, 0) if grasp.is_valid else (0, 165, 255)
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
@@ -89,7 +89,12 @@ def draw_grasp(image: np.ndarray, grasp: GraspPose) -> None:
         line1 = f"{grasp.class_name} {grasp.conf:.2f}"
         line2 = grasp.rejected_reason or "invalid"
 
-    bg_w = max(len(line1), len(line2)) * 10
+    if tags:
+        line1 = f"{'/'.join(tags)} {line1}"
+
+    size1, _ = cv2.getTextSize(line1, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    size2, _ = cv2.getTextSize(line2, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    bg_w = max(size1[0], size2[0]) + 8
     cv2.rectangle(image, (x1, y1 - 42), (x1 + bg_w, y1), (0, 0, 0), -1)
     cv2.putText(image, line1, (x1 + 4, y1 - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     cv2.putText(image, line2, (x1 + 4, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)

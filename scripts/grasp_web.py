@@ -21,6 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import cv2
@@ -56,6 +57,11 @@ from scripts.graspnet_camera_demo import (  # noqa: E402
     overlay_status,
     select_target,
     target_status_text,
+)
+from utils.ordinary_grasp import (  # noqa: E402
+    GraspPose,
+    draw_grasp as draw_ordinary_grasp,
+    estimate_grasps as estimate_ordinary_grasps,
 )
 from graspnetAPI.grasp import Grasp, GraspGroup  # noqa: E402
 
@@ -100,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-device", default=None)
     parser.add_argument("--yolo-conf", type=float, default=None)
     parser.add_argument("--yolo-iou", type=float, default=None)
-    parser.add_argument("--infer-every-live", type=int, default=None)
+    parser.add_argument("--infer-every-live", type=int, default=1, help="run YOLO/ordinary preview every N frames")
     parser.add_argument("--pregrasp-offset", type=float, default=None)
     parser.add_argument("--retreat-offset", type=float, default=None)
     parser.add_argument("--grasp-forward-offset", type=float, default=None, help="meters; move final grasp farther along approach axis")
@@ -129,26 +135,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-home-after-place", action="store_true", help="return ready pose instead of joint-zero home after placing")
     parser.add_argument("--gripper-open-width", type=float, default=0.09)
     parser.add_argument("--jpeg-quality", type=int, default=80)
-    parser.add_argument("--graspnet-interval", type=float, default=2.0, help="seconds between automatic grasp-point updates")
-    parser.add_argument("--no-auto-graspnet", action="store_true", help="disable automatic grasp-point updates")
+    parser.add_argument("--graspnet-interval", type=float, default=1.0, help="seconds between automatic grasp-point updates")
+    parser.add_argument("--auto-graspnet", dest="no_auto_graspnet", action="store_false", help="enable automatic GraspNet updates")
+    parser.add_argument("--no-auto-graspnet", action="store_true", help="disable automatic GraspNet updates")
+    parser.add_argument("--no-ordinary-grasp", action="store_true", help="disable high-frequency ordinary grasp preview")
+    parser.add_argument("--ordinary-depth-quantile", type=float, default=None, help="depth quantile used by ordinary grasp preview")
+    parser.set_defaults(no_auto_graspnet=True)
     return parser.parse_args()
+
+
+def detection_tags(target: DetectionTarget, selected: DetectionTarget | None) -> list[str]:
+    if selected is not None:
+        selected_key = (selected.result_index, selected.detection_index)
+        target_key = (target.result_index, target.detection_index)
+        if target_key == selected_key:
+            return ["target"]
+    return []
 
 
 def draw_detection_boxes(frame: np.ndarray, targets: list, selected, target_class: str | None) -> np.ndarray:
     display = frame.copy()
-    selected_key = None
-    if selected is not None:
-        selected_key = (selected.result_index, selected.detection_index)
-
     for target in targets:
-        is_selected = selected_key == (target.result_index, target.detection_index)
+        tags = detection_tags(target, selected)
+        is_selected = "target" in tags
         color = (0, 255, 80) if is_selected else (0, 185, 255)
         thickness = 3 if is_selected else 2
         x1, y1, x2, y2 = target.bbox_xyxy
         cv2.rectangle(display, (x1, y1), (x2, y2), color, thickness)
         label = f"{target.class_name} {target.conf:.2f}"
-        if target_class and is_selected:
-            label = f"TARGET {label}"
+        if tags:
+            label = f"{'/'.join(tags)} {label}"
         label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         bg_y1 = max(0, y1 - label_size[1] - 8)
         cv2.rectangle(display, (x1, bg_y1), (x1 + label_size[0] + 8, y1), (0, 0, 0), -1)
@@ -198,6 +214,32 @@ def remap_generic_class_name(name: str) -> str:
 def remap_targets_to_coco(targets: list[DetectionTarget]) -> None:
     for target in targets:
         target.class_name = remap_generic_class_name(target.class_name)
+
+
+def remap_ordinary_grasps_to_coco(grasps: list[GraspPose]) -> None:
+    for grasp in grasps:
+        grasp.class_name = remap_generic_class_name(grasp.class_name)
+
+
+def select_ordinary_target(grasps: list[GraspPose], target_class: str | None) -> GraspPose | None:
+    valid = [grasp for grasp in grasps if grasp.is_valid]
+    if not valid:
+        return None
+    candidates = valid
+    if target_class:
+        target_norm = target_class.casefold()
+        exact = [grasp for grasp in valid if grasp.class_name.casefold() == target_norm]
+        contains = [grasp for grasp in valid if target_norm in grasp.class_name.casefold()]
+        candidates = exact or contains
+    if not candidates:
+        return None
+    return max(candidates, key=lambda grasp: grasp.conf)
+
+
+def ordinary_grasp_tags(grasp: GraspPose, selected: GraspPose | None) -> list[str]:
+    if selected is grasp:
+        return ["target"]
+    return []
 
 
 def _project_point(K: np.ndarray, xyz: np.ndarray) -> tuple[int, int] | None:
@@ -255,8 +297,9 @@ def draw_bottom_grasp_summary(frame: np.ndarray, info: dict | None) -> None:
     uv = info.get("uv")
     if len(xyz) != 3:
         return
+    method = info.get("method", "grasp")
     text = (
-        f"best={info.get('target')} score={info.get('score'):.2f} "
+        f"{method}={info.get('target')} score={info.get('score'):.2f} "
         f"uv={uv} xyz=({xyz[0]:+.3f},{xyz[1]:+.3f},{xyz[2]:+.3f}) "
         f"width={float(info.get('width_m', 0.0)) * 100:.1f}cm"
     )
@@ -272,6 +315,11 @@ class GraspWebApp:
         self.target_class = args.target_class or ""
         self.class_names: list[str] = []
         grasp_cfg = self.cfg.get("grasp_pipeline", {}).get("grasp", {})
+        self.ordinary_depth_quantile = float(
+            args.ordinary_depth_quantile
+            if args.ordinary_depth_quantile is not None
+            else grasp_cfg.get("depth_quantile", 0.75)
+        )
         self.grasp_forward_offset_m = float(
             args.grasp_forward_offset
             if args.grasp_forward_offset is not None
@@ -357,6 +405,7 @@ class GraspWebApp:
         self.cam = None
         self.K: np.ndarray | None = None
         self.robot: RebotArm | None = None
+        self.ready_joints: np.ndarray | None = None
         self.T_hand_eye: np.ndarray | None = None
         self.calibration_path: Path | None = None
         self.calibration_status = "not checked"
@@ -379,6 +428,10 @@ class GraspWebApp:
         self.last_grasps: GraspGroup | None = None
         self.last_best: Grasp | None = None
         self.last_grasp_info: dict | None = None
+        self.last_ordinary_grasps: list[GraspPose] = []
+        self.last_ordinary_best: GraspPose | None = None
+        self.last_ordinary_info: dict | None = None
+        self.ordinary_status = "ordinary grasp disabled" if args.no_ordinary_grasp else "ordinary grasp waiting..."
 
         self.status = "starting..."
         self.target_status = "target detector starting..."
@@ -477,7 +530,51 @@ class GraspWebApp:
         self.robot.init_gripper()
         print("[Web] moving robot to ready pose...")
         _move_ready(self.robot, ready_cfg)
+        self.ready_joints = self.robot.get_joint_positions().copy()
         print("[Web] robot connected, motors enabled, ready pose reached")
+
+    def prepare_grasp(self) -> dict:
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "ready grasp disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        if not self.infer_lock.acquire(blocking=False):
+            return {"ok": False, "error": "robot or grasp estimator is busy"}
+
+        self.busy = True
+        self.status = "moving robot to ready grasp pose..."
+        try:
+            robot_cfg = self.cfg.get("robot", {})
+            ready_cfg = robot_cfg.get(
+                "ready_pose",
+                {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
+            )
+            self.robot.open_gripper(distance_m=float(self.args.gripper_open_width))
+            _move_ready(self.robot, ready_cfg)
+            self.ready_joints = self.robot.get_joint_positions().copy()
+            with self.frame_lock:
+                self.last_grasps = None
+                self.last_best = None
+                self.last_grasp_info = None
+                self.last_ordinary_grasps = []
+                self.last_ordinary_best = None
+                self.last_ordinary_info = None
+                self.ordinary_status = "ready pose reached; waiting for YOLO"
+            self.pending_grasp_update.set()
+            self.status = "ready grasp pose active; grasp update queued"
+            return {
+                "ok": True,
+                "status": self.status,
+                "ready_joints_deg": [round(float(v), 2) for v in np.degrees(self.ready_joints).tolist()],
+                "grasp_update_queued": True,
+            }
+        except Exception as exc:
+            traceback.print_exc()
+            self.status = f"ready grasp failed: {exc}"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.busy = False
+            self.infer_lock.release()
 
     def _class_names_from_yolo(self) -> list[str]:
         if self.yolo_model is None:
@@ -575,7 +672,7 @@ class GraspWebApp:
                     self.latest_color = color_bgr.copy()
                     self.latest_depth = depth_mm.copy()
 
-                self._maybe_update_yolo(color_bgr)
+                self._maybe_update_yolo(color_bgr, depth_mm)
                 self._maybe_start_auto_grasp()
                 display = self._draw_preview(color_bgr)
                 ok, encoded = cv2.imencode(
@@ -590,33 +687,76 @@ class GraspWebApp:
                 self.status = f"capture error: {exc}"
                 time.sleep(0.2)
 
-    def _maybe_update_yolo(self, color_bgr: np.ndarray) -> None:
+    def _maybe_update_yolo(self, color_bgr: np.ndarray, depth_mm: np.ndarray) -> None:
         if self.yolo_model is None:
             self.target_status = "YOLO disabled: full-scene GraspNet"
+            self.ordinary_status = "ordinary grasp needs YOLO"
             return
         infer_every = int(self.yolo_opts.get("infer_every", 3))
         pending_update = self.pending_grasp_update.is_set()
         if not pending_update and self.frame_index != 1 and self.frame_index % max(1, infer_every) != 0:
             return
-        if not self.model_lock.acquire(blocking=False):
-            return
         try:
-            _, targets, selected = detect_targets(
-                self.yolo_model,
-                color_bgr,
-                self.yolo_opts,
-                self.target_class or None,
-            )
+            if not self.model_lock.acquire(blocking=False):
+                return
+            try:
+                results, targets, selected = detect_targets(
+                    self.yolo_model,
+                    color_bgr,
+                    self.yolo_opts,
+                    self.target_class or None,
+                )
+            finally:
+                self.model_lock.release()
             remap_targets_to_coco(targets)
             selected = select_target(targets, self.target_class or None)
+            ordinary_grasps, ordinary_best, ordinary_info, ordinary_status = self._ordinary_from_yolo_results(
+                results,
+                depth_mm,
+            )
             with self.frame_lock:
                 self.last_targets = targets
                 self.selected_target = selected
                 self.target_status = target_status_text(selected, targets, self.target_class or None)
+                self.last_ordinary_grasps = ordinary_grasps
+                self.last_ordinary_best = ordinary_best
+                self.last_ordinary_info = ordinary_info
+                self.ordinary_status = ordinary_status
         except Exception as exc:
             self.target_status = f"YOLO failed: {exc}"
-        finally:
-            self.model_lock.release()
+            self.ordinary_status = f"ordinary grasp failed: {exc}"
+
+    def _ordinary_from_yolo_results(
+        self,
+        results: list[Any],
+        depth_mm: np.ndarray,
+    ) -> tuple[list[GraspPose], GraspPose | None, dict | None, str]:
+        if self.args.no_ordinary_grasp:
+            return [], None, None, "ordinary grasp disabled"
+        if self.K is None:
+            return [], None, None, "ordinary grasp waiting for camera intrinsics"
+
+        grasps = estimate_ordinary_grasps(
+            results,
+            depth_mm,
+            self.K,
+            depth_quantile=self.ordinary_depth_quantile,
+        )
+        remap_ordinary_grasps_to_coco(grasps)
+        target_class = self.target_class or None
+        best = select_ordinary_target(grasps, target_class)
+        if best is None:
+            valid_count = sum(1 for grasp in grasps if grasp.is_valid)
+            target_text = target_class or "best detection"
+            status = f"ordinary no valid grasp for {target_text}; detections={len(grasps)} valid={valid_count}"
+            return grasps, None, None, status
+
+        info = self._ordinary_grasp_info(best)
+        status = (
+            f"ordinary target={best.class_name} conf={best.conf:.2f} "
+            f"valid_depth={best.valid_depth_pixels} z={float(best.position[2]):.3f}m"
+        )
+        return grasps, best, info, status
 
     def _maybe_start_auto_grasp(self) -> None:
         pending_update = self.pending_grasp_update.is_set()
@@ -653,12 +793,18 @@ class GraspWebApp:
             selected = self.selected_target
             best = self.last_best
             grasp_info = dict(self.last_grasp_info) if self.last_grasp_info is not None else None
+            ordinary_grasps = list(self.last_ordinary_grasps)
+            ordinary_best = self.last_ordinary_best
+            ordinary_info = dict(self.last_ordinary_info) if self.last_ordinary_info is not None else None
             target_status = self.target_status
             auto_enabled = not self.args.no_auto_graspnet
             interval = max(0.5, float(self.args.graspnet_interval))
         display_base = color_bgr
         if self.yolo_model is not None:
             display_base = draw_detection_boxes(color_bgr, targets, selected, self.target_class or None)
+            if not self.args.no_ordinary_grasp:
+                for ordinary_grasp in ordinary_grasps:
+                    draw_ordinary_grasp(display_base, ordinary_grasp, tags=ordinary_grasp_tags(ordinary_grasp, ordinary_best))
         mode = "BUSY" if self.busy else "LIVE"
         auto_text = f"auto grasp {interval:.1f}s" if auto_enabled else "auto grasp off"
         display = overlay_status(
@@ -668,7 +814,7 @@ class GraspWebApp:
             target_status,
         )
         draw_graspnet_grasp_point(display, best, self.K)
-        draw_bottom_grasp_summary(display, grasp_info)
+        draw_bottom_grasp_summary(display, grasp_info or ordinary_info)
         return display
 
     def get_jpeg(self) -> bytes | None:
@@ -681,10 +827,15 @@ class GraspWebApp:
             return {"ok": False, "error": f"unknown class: {class_name}"}
         self.target_class = class_name
         with self.frame_lock:
-            self.selected_target = None
+            self.selected_target = select_target(self.last_targets, self.target_class or None)
+            self.target_status = target_status_text(self.selected_target, self.last_targets, self.target_class or None)
             self.last_grasps = None
             self.last_best = None
             self.last_grasp_info = None
+            self.last_ordinary_grasps = []
+            self.last_ordinary_best = None
+            self.last_ordinary_info = None
+            self.ordinary_status = "ordinary target changed; waiting for YOLO"
         self.pending_grasp_update.set()
         self.status = "target changed; GraspNet update queued"
         return {"ok": True, "target_class": self.target_class, "grasp_update_queued": True}
@@ -759,17 +910,17 @@ class GraspWebApp:
 
     def state(self) -> dict:
         with self.frame_lock:
-            detections = [
-                {
+            detections = []
+            for target in self.last_targets:
+                tags = detection_tags(target, self.selected_target)
+                detections.append({
                     "class_name": target.class_name,
                     "conf": round(float(target.conf), 4),
                     "bbox_xyxy": list(target.bbox_xyxy),
-                    "selected": self.selected_target is not None
-                    and (target.result_index, target.detection_index)
-                    == (self.selected_target.result_index, self.selected_target.detection_index),
-                }
-                for target in self.last_targets
-            ]
+                    "selected": "target" in tags,
+                    "tag": tags[0] if tags else "",
+                    "tags": tags,
+                })
         if self.robot is not None:
             robot_status = "connected/enabled; waiting for explicit real grasp command"
         elif self.args.enable_robot and self.T_hand_eye is None:
@@ -785,6 +936,9 @@ class GraspWebApp:
             "robot_connected": self.robot is not None,
             "robot_status": robot_status,
             "grasp_method": "graspnet",
+            "ordinary_enabled": not self.args.no_ordinary_grasp,
+            "ordinary_status": self.ordinary_status,
+            "ordinary_grasp": self.last_ordinary_info,
             "auto_graspnet": not self.args.no_auto_graspnet,
             "grasp_update_queued": self.pending_grasp_update.is_set(),
             "grasp_forward_offset_m": round(float(self.grasp_forward_offset_m), 4),
@@ -812,13 +966,12 @@ class GraspWebApp:
                 return {"ok": False, "error": "no RGB-D frame available"}
 
             call_args = self._args_for_current_target()
-            with self.model_lock:
-                best, status, target_status, targets, selected, grasps = self._infer_current_frame_web(
-                    color,
-                    depth,
-                    self.K,
-                    call_args,
-                )
+            best, status, target_status, targets, selected, grasps = self._infer_current_frame_web(
+                color,
+                depth,
+                self.K,
+                call_args,
+            )
 
             info = self._grasp_info(best, selected) if best is not None else None
             if info is not None:
@@ -836,6 +989,7 @@ class GraspWebApp:
             if best is None:
                 return {"ok": False, "error": "no valid GraspNet grasp", "status": status}
 
+            self.pending_grasp_update.clear()
             if execute:
                 return self._execute_best(best)
 
@@ -863,10 +1017,30 @@ class GraspWebApp:
             return {"ok": False, "error": "hand-eye calibration unavailable"}
 
         self.execute_requested.set()
-        self.busy = True
-        self.status = "waiting for current GraspNet update before real grasp..."
         acquired = False
         try:
+            with self.frame_lock:
+                ordinary_best = self.last_ordinary_best
+                ordinary_info = dict(self.last_ordinary_info) if self.last_ordinary_info is not None else None
+
+            if ordinary_best is not None:
+                self.status = "executing current ordinary grasp..."
+                acquired = self.infer_lock.acquire(timeout=2.0)
+                if not acquired:
+                    return {
+                        "ok": False,
+                        "error": "robot or GraspNet update is busy; wait a moment and click Real grasp again",
+                    }
+                self.busy = True
+                result = self._execute_ordinary_best(ordinary_best)
+                if ordinary_info is not None:
+                    result["grasp"] = ordinary_info
+                with self.frame_lock:
+                    self.status = str(result.get("status", "ordinary real grasp command finished"))
+                return result
+
+            self.busy = True
+            self.status = "no ordinary grasp; waiting for current GraspNet update before real grasp..."
             acquired = self.infer_lock.acquire(timeout=20.0)
             if not acquired:
                 return {"ok": False, "error": "timed out waiting for current GraspNet update"}
@@ -886,13 +1060,12 @@ class GraspWebApp:
                     return {"ok": False, "error": "no RGB-D frame available for immediate grasp"}
 
                 call_args = self._args_for_current_target()
-                with self.model_lock:
-                    best, status, target_status, targets, selected, grasps = self._infer_current_frame_web(
-                        color,
-                        depth,
-                        self.K,
-                        call_args,
-                    )
+                best, status, target_status, targets, selected, grasps = self._infer_current_frame_web(
+                    color,
+                    depth,
+                    self.K,
+                    call_args,
+                )
                 info = self._grasp_info(best, selected) if best is not None else None
                 if info is not None:
                     self._print_grasp_info(info, auto=False)
@@ -947,7 +1120,8 @@ class GraspWebApp:
         if self.yolo_model is None:
             target_status = "YOLO disabled: full-scene GraspNet"
         else:
-            _, targets, _ = detect_targets(self.yolo_model, color_bgr, self.yolo_opts, args.target_class)
+            with self.model_lock:
+                _, targets, _ = detect_targets(self.yolo_model, color_bgr, self.yolo_opts, args.target_class)
             remap_targets_to_coco(targets)
             selected_target = select_target(targets, args.target_class)
             target_status = target_status_text(selected_target, targets, args.target_class)
@@ -1007,6 +1181,20 @@ class GraspWebApp:
             "target": selected.class_name if selected is not None else (self.target_class or "full scene"),
         }
 
+    def _ordinary_grasp_info(self, best: GraspPose) -> dict:
+        xyz = [round(float(v), 4) for v in np.asarray(best.position, dtype=np.float64).tolist()]
+        return {
+            "method": "ordinary",
+            "score": round(float(best.conf), 4),
+            "width_m": round(float(best.jaw_width_m), 4),
+            "object_length_m": round(float(best.object_length_m), 4),
+            "translation": xyz,
+            "uv": [int(best.center_px[0]), int(best.center_px[1])],
+            "target": best.class_name,
+            "angle_deg": round(float(best.angle_deg), 3),
+            "valid_depth_pixels": int(best.valid_depth_pixels),
+        }
+
     def _dry_run_plan(self, best) -> dict | None:
         if self.robot is None or self.T_hand_eye is None:
             return None
@@ -1045,6 +1233,75 @@ class GraspWebApp:
             "pregrasp6d": [round(float(v), 4) for v in pre6d],
             "retreat6d": [round(float(v), 4) for v in retreat6d],
         }
+
+    def _execute_ordinary_best(self, best: GraspPose) -> dict:
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "real grasp disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        if self.T_hand_eye is None:
+            return {"ok": False, "error": "hand-eye calibration unavailable"}
+        if best.position is None or best.tcp_rotation is None:
+            return {"ok": False, "error": "ordinary grasp has no valid 3D pose"}
+
+        grasp_cfg = self.cfg.get("grasp_pipeline", {}).get("grasp", {})
+        place_cfg = build_place_config(self.cfg, self.args)
+        robot_cfg = self.cfg.get("robot", {})
+        ready_cfg = robot_cfg.get(
+            "ready_pose",
+            {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
+        )
+        pregrasp_offset_m = float(
+            self.args.pregrasp_offset if self.args.pregrasp_offset is not None else grasp_cfg.get("pregrasp_offset_m", 0.08)
+        )
+        retreat_offset_m = float(self.args.retreat_offset if self.args.retreat_offset is not None else pregrasp_offset_m)
+        t_cam2base = _cam_to_base(self.T_hand_eye, self.robot)
+        ordinary_as_grasp = SimpleNamespace(
+            translation=np.asarray(best.position, dtype=np.float64),
+            rotation_matrix=np.asarray(best.tcp_rotation, dtype=np.float64),
+            width=float(best.jaw_width_m),
+        )
+        grasp6d, pre6d, retreat6d = _transform_grasp(
+            ordinary_as_grasp,
+            t_cam2base,
+            pregrasp_offset_m,
+            retreat_offset_m,
+            forward_offset_m=self.grasp_forward_offset_m,
+            lateral_offset_m=self.grasp_lateral_offset_m,
+            vertical_offset_m=self.grasp_vertical_offset_m,
+            roll_offset_rad=np.radians(self.grasp_roll_offset_deg),
+            pitch_offset_rad=np.radians(self.grasp_pitch_offset_deg),
+            yaw_offset_rad=np.radians(self.grasp_yaw_offset_deg),
+            camera_x_offset_m=self.camera_x_offset_m,
+            camera_y_offset_m=self.camera_y_offset_m,
+            camera_z_offset_m=self.camera_z_offset_m,
+            camera_roll_offset_rad=np.radians(self.camera_roll_offset_deg),
+            camera_pitch_offset_rad=np.radians(self.camera_pitch_offset_deg),
+            camera_yaw_offset_rad=np.radians(self.camera_yaw_offset_deg),
+            base_x_offset_m=self.base_x_offset_m,
+            base_y_offset_m=self.base_y_offset_m,
+            base_z_offset_m=self.base_z_offset_m,
+            base_roll_offset_rad=np.radians(self.base_roll_offset_deg),
+            base_pitch_offset_rad=np.radians(self.base_pitch_offset_deg),
+            base_yaw_offset_rad=np.radians(self.base_yaw_offset_deg),
+        )
+        print("\n[G] Web ordinary 当前最佳夹取:")
+        print(f"  target={best.class_name} conf={best.conf:.4f}")
+        print(f"  center_px={best.center_px} angle_deg={best.angle_deg:.2f}")
+        print(f"  width_m={best.jaw_width_m:.4f}")
+        print(f"  position_xyz={np.asarray(best.position, dtype=np.float64).round(4).tolist()}")
+        ok = _execute_grasp(
+            self.robot,
+            grasp6d,
+            pre6d,
+            retreat6d,
+            ready_cfg,
+            dry_run=False,
+            gripper_width_m=max(float(self.args.gripper_open_width), float(best.jaw_width_m) + 0.02),
+            place_cfg=place_cfg,
+            ready_joints=self.ready_joints,
+        )
+        return {"ok": bool(ok), "status": "ordinary real grasp executed" if ok else "ordinary real grasp attempted"}
 
     def _execute_best(self, best) -> dict:
         if not self.args.enable_robot:
@@ -1098,6 +1355,7 @@ class GraspWebApp:
             dry_run=False,
             gripper_width_m=max(float(self.args.gripper_open_width), float(best.width) + 0.02),
             place_cfg=place_cfg,
+            ready_joints=self.ready_joints,
         )
         return {"ok": bool(ok), "status": "real grasp executed" if ok else "real grasp attempted"}
 
@@ -1187,13 +1445,14 @@ INDEX_TEMPLATE = """<!doctype html>
     button {{ cursor: pointer; }}
     button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
     button.danger {{ background: #5b1e24; border-color: #9f3440; }}
+    button.secondary {{ background: #1d2833; }}
     main {{ display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 12px; padding: 12px; }}
     img {{ width: 100%; height: auto; background: #000; border: 1px solid #33404d; }}
     pre {{ white-space: pre-wrap; word-break: break-word; background: #151b22; border: 1px solid #33404d; padding: 10px; border-radius: 6px; min-height: 260px; }}
     aside {{ display: flex; flex-direction: column; gap: 10px; }}
     .controls {{ background: #151b22; border: 1px solid #33404d; border-radius: 6px; padding: 10px; }}
     .control-title {{ font-weight: 700; margin-bottom: 8px; }}
-    .control-row {{ display: grid; grid-template-columns: 90px repeat(3, minmax(0, 1fr)); gap: 6px; align-items: center; margin-bottom: 6px; }}
+    .control-row {{ display: grid; grid-template-columns: 120px repeat(3, minmax(0, 1fr)); gap: 6px; align-items: center; margin-bottom: 6px; }}
     .control-row label {{ color: #c7d2dd; }}
     .control-actions {{ display: flex; gap: 8px; margin-top: 8px; }}
     .status {{ color: #9ee493; }}
@@ -1204,81 +1463,208 @@ INDEX_TEMPLATE = """<!doctype html>
 <body>
   <header>
     <strong>reBot Grasp Web</strong>
-    <label>目标类别</label>
+    <button id="languageToggle" type="button" class="secondary" aria-pressed="false">English</button>
+    <label data-i18n="targetClassLabel">目标类别</label>
     <select id="target">{options}</select>
-    <button id="setTarget">设置目标</button>
-    <button id="infer">刷新抓取点</button>
-    <button id="grasp" class="danger">真实抓取</button>
-    <span class="muted" id="modeHint">自动显示 GraspNet 抓取点；真实抓取需用 --enable-robot 启动</span>
+    <button id="setTarget" data-i18n="setTarget">设置目标</button>
+    <button id="infer" data-i18n="refreshGrasp">刷新抓取点</button>
+    <button id="grasp" class="danger" data-i18n="realGrasp">真实抓取</button>
+    <button id="readyPose" class="secondary" data-i18n="readyGrasp">预备抓取</button>
+    <span class="muted" id="modeHint" data-i18n="modeHintInitial">自动显示 ordinary 抓取点；真实抓取需用 --enable-robot 启动</span>
   </header>
   <main>
-    <section><img src="/stream.mjpg" alt="camera stream"></section>
+    <section><img src="/stream.mjpg" alt="camera stream" data-i18n-alt="cameraStreamAlt"></section>
     <aside>
       <section class="controls">
-        <div class="control-title">补偿输入</div>
+        <div class="control-title" data-i18n="compensationTitle">补偿输入</div>
         <div class="control-row">
-          <label>夹爪前/左/上(m)</label>
-          <input id="forwardOffset" type="number" min="-0.15" max="0.15" step="0.001" value="0.000" title="夹爪前后补偿；正数沿接近方向前进">
-          <input id="lateralOffset" type="number" min="-0.15" max="0.15" step="0.001" value="0.000" title="夹爪左右补偿；正数沿夹爪 Y 轴">
-          <input id="verticalOffset" type="number" min="-0.15" max="0.15" step="0.001" value="0.000" title="夹爪上下补偿；正数沿夹爪 Z 轴">
+          <label data-i18n="gripperOffsetLabel">夹爪前/左/上(m)</label>
+          <input id="forwardOffset" type="number" min="-0.15" max="0.15" step="0.001" value="0.000" title="夹爪前后补偿；正数沿接近方向前进" data-i18n-title="forwardOffsetTitle">
+          <input id="lateralOffset" type="number" min="-0.15" max="0.15" step="0.001" value="0.000" title="夹爪左右补偿；正数沿夹爪 Y 轴" data-i18n-title="lateralOffsetTitle">
+          <input id="verticalOffset" type="number" min="-0.15" max="0.15" step="0.001" value="0.000" title="夹爪上下补偿；正数沿夹爪 Z 轴" data-i18n-title="verticalOffsetTitle">
         </div>
         <div class="control-row">
-          <label>夹爪RPY(°)</label>
-          <input id="rollOffset" type="number" min="-45" max="45" step="1" value="0.0" title="夹爪 roll 补偿">
-          <input id="pitchOffset" type="number" min="-45" max="45" step="1" value="0.0" title="夹爪 pitch 补偿">
-          <input id="yawOffset" type="number" min="-45" max="45" step="1" value="0.0" title="夹爪 yaw 补偿">
+          <label data-i18n="gripperRpyLabel">夹爪RPY(°)</label>
+          <input id="rollOffset" type="number" min="-45" max="45" step="1" value="0.0" title="夹爪 roll 补偿" data-i18n-title="rollOffsetTitle">
+          <input id="pitchOffset" type="number" min="-45" max="45" step="1" value="0.0" title="夹爪 pitch 补偿" data-i18n-title="pitchOffsetTitle">
+          <input id="yawOffset" type="number" min="-45" max="45" step="1" value="0.0" title="夹爪 yaw 补偿" data-i18n-title="yawOffsetTitle">
         </div>
         <div class="control-row">
-          <label>相机XYZ(m)</label>
-          <input id="cameraXOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="相机 X 外参补偿">
-          <input id="cameraYOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="相机 Y 外参补偿">
-          <input id="cameraZOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="相机 Z 外参补偿">
+          <label data-i18n="cameraXyzLabel">相机XYZ(m)</label>
+          <input id="cameraXOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="相机 X 外参补偿" data-i18n-title="cameraXOffsetTitle">
+          <input id="cameraYOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="相机 Y 外参补偿" data-i18n-title="cameraYOffsetTitle">
+          <input id="cameraZOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="相机 Z 外参补偿" data-i18n-title="cameraZOffsetTitle">
         </div>
         <div class="control-row">
-          <label>相机RPY(°)</label>
-          <input id="cameraRollOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="相机 X roll 外参补偿">
-          <input id="cameraPitchOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="相机 Y pitch 外参补偿">
-          <input id="cameraYawOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="相机 Z yaw 外参补偿">
+          <label data-i18n="cameraRpyLabel">相机RPY(°)</label>
+          <input id="cameraRollOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="相机 X roll 外参补偿" data-i18n-title="cameraRollOffsetTitle">
+          <input id="cameraPitchOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="相机 Y pitch 外参补偿" data-i18n-title="cameraPitchOffsetTitle">
+          <input id="cameraYawOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="相机 Z yaw 外参补偿" data-i18n-title="cameraYawOffsetTitle">
         </div>
         <div class="control-row">
-          <label>基座XYZ(m)</label>
-          <input id="baseXOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="机器人基座 X 外参补偿">
-          <input id="baseYOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="机器人基座 Y 外参补偿">
-          <input id="baseZOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="机器人基座 Z 外参补偿">
+          <label data-i18n="baseXyzLabel">基座XYZ(m)</label>
+          <input id="baseXOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="机器人基座 X 外参补偿" data-i18n-title="baseXOffsetTitle">
+          <input id="baseYOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="机器人基座 Y 外参补偿" data-i18n-title="baseYOffsetTitle">
+          <input id="baseZOffset" type="number" min="-0.20" max="0.20" step="0.001" value="0.000" title="机器人基座 Z 外参补偿" data-i18n-title="baseZOffsetTitle">
         </div>
         <div class="control-row">
-          <label>基座RPY(°)</label>
-          <input id="baseRollOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="机器人基座 X roll 外参补偿">
-          <input id="basePitchOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="机器人基座 Y pitch 外参补偿">
-          <input id="baseYawOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="机器人基座 Z yaw 外参补偿">
+          <label data-i18n="baseRpyLabel">基座RPY(°)</label>
+          <input id="baseRollOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="机器人基座 X roll 外参补偿" data-i18n-title="baseRollOffsetTitle">
+          <input id="basePitchOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="机器人基座 Y pitch 外参补偿" data-i18n-title="basePitchOffsetTitle">
+          <input id="baseYawOffset" type="number" min="-45" max="45" step="0.5" value="0.0" title="机器人基座 Z yaw 外参补偿" data-i18n-title="baseYawOffsetTitle">
         </div>
         <div class="control-actions">
-          <button id="setOffset">设置补偿</button>
+          <button id="setOffset" data-i18n="setOffset">设置补偿</button>
         </div>
       </section>
       <section class="controls">
-        <div class="control-title">底座电机调试</div>
+        <div class="control-title" data-i18n="baseJogTitle">底座电机调试</div>
         <div class="control-row">
-          <label>joint1 jog(°)</label>
-          <input id="baseJogDeg" type="number" min="-180" max="180" step="1" value="-30" title="底座电机 joint1 相对角度；负数走负方向">
-          <input id="baseJogDuration" type="number" min="0.2" max="10" step="0.1" value="2.5" title="底座电机运动时长，单位秒">
-          <input id="baseJogMargin" type="number" min="0" max="45" step="0.5" value="5.0" title="joint1 限位安全边距，单位度">
+          <label data-i18n="baseJogDegLabel">joint1 jog(°)</label>
+          <input id="baseJogDeg" type="number" min="-180" max="180" step="1" value="-30" title="底座电机 joint1 相对角度；负数走负方向" data-i18n-title="baseJogDegTitle">
+          <input id="baseJogDuration" type="number" min="0.2" max="10" step="0.1" value="2.5" title="底座电机运动时长，单位秒" data-i18n-title="baseJogDurationTitle">
+          <input id="baseJogMargin" type="number" min="0" max="45" step="0.5" value="5.0" title="joint1 限位安全边距，单位度" data-i18n-title="baseJogMarginTitle">
         </div>
         <div class="control-actions">
           <button id="baseJogNeg">-30°</button>
-          <button id="baseJogApply">执行底座jog</button>
+          <button id="baseJogApply" data-i18n="baseJogApply">执行底座jog</button>
           <button id="baseJogPos">+30°</button>
         </div>
       </section>
-      <div class="status" id="status">loading...</div>
+      <div class="status" id="status" data-i18n="loading">loading...</div>
       <pre id="state"></pre>
     </aside>
   </main>
   <script>
+    const I18N = {{
+      zh: {{
+        languageToggle: 'English',
+        targetClassLabel: '目标类别',
+        bestDetection: '最佳检测',
+        setTarget: '设置目标',
+        refreshGrasp: '刷新抓取点',
+        realGrasp: '真实抓取',
+        readyGrasp: '预备抓取',
+        modeHintInitial: '自动显示 ordinary 抓取点；真实抓取需用 --enable-robot 启动',
+        modeHintConnected: '自动更新 ordinary 抓取点；点击真实抓取会优先执行当前 ordinary 抓取点',
+        modeHintDisconnected: '自动更新 ordinary 抓取点；真实抓取需重启脚本并加 --enable-robot',
+        cameraStreamAlt: '相机画面',
+        compensationTitle: '补偿输入',
+        gripperOffsetLabel: '夹爪前/左/上(m)',
+        gripperRpyLabel: '夹爪RPY(°)',
+        cameraXyzLabel: '相机XYZ(m)',
+        cameraRpyLabel: '相机RPY(°)',
+        baseXyzLabel: '基座XYZ(m)',
+        baseRpyLabel: '基座RPY(°)',
+        setOffset: '设置补偿',
+        baseJogTitle: '底座电机调试',
+        baseJogDegLabel: 'joint1 jog(°)',
+        baseJogApply: '执行底座jog',
+        loading: 'loading...',
+        forwardOffsetTitle: '夹爪前后补偿；正数沿接近方向前进',
+        lateralOffsetTitle: '夹爪左右补偿；正数沿夹爪 Y 轴',
+        verticalOffsetTitle: '夹爪上下补偿；正数沿夹爪 Z 轴',
+        rollOffsetTitle: '夹爪 roll 补偿',
+        pitchOffsetTitle: '夹爪 pitch 补偿',
+        yawOffsetTitle: '夹爪 yaw 补偿',
+        cameraXOffsetTitle: '相机 X 外参补偿',
+        cameraYOffsetTitle: '相机 Y 外参补偿',
+        cameraZOffsetTitle: '相机 Z 外参补偿',
+        cameraRollOffsetTitle: '相机 X roll 外参补偿',
+        cameraPitchOffsetTitle: '相机 Y pitch 外参补偿',
+        cameraYawOffsetTitle: '相机 Z yaw 外参补偿',
+        baseXOffsetTitle: '机器人基座 X 外参补偿',
+        baseYOffsetTitle: '机器人基座 Y 外参补偿',
+        baseZOffsetTitle: '机器人基座 Z 外参补偿',
+        baseRollOffsetTitle: '机器人基座 X roll 外参补偿',
+        basePitchOffsetTitle: '机器人基座 Y pitch 外参补偿',
+        baseYawOffsetTitle: '机器人基座 Z yaw 外参补偿',
+        baseJogDegTitle: '底座电机 joint1 相对角度；负数走负方向',
+        baseJogDurationTitle: '底座电机运动时长，单位秒',
+        baseJogMarginTitle: 'joint1 限位安全边距，单位度',
+        numberExampleError: '请输入数字，例如 -0.010 或 0.080',
+        numberRequired: '请输入数字',
+        confirmGrasp: '确认执行真实抓取？',
+        refreshingGrasp: '正在计算 GraspNet 抓取点...',
+        errorPrefix: 'ERROR: ',
+        failed: 'failed',
+        stateErrorPrefix: 'state error: ',
+        autoGraspLabel: '自动 GraspNet',
+        robotConnected: '机械臂已连接',
+        robotDisconnected: '机械臂未连接',
+        baseJogDurationName: '运动时长',
+        baseJogMarginName: '限位安全边距'
+      }},
+      en: {{
+        languageToggle: '中文',
+        targetClassLabel: 'Target class',
+        bestDetection: 'Best detection',
+        setTarget: 'Set target',
+        refreshGrasp: 'Refresh grasp',
+        realGrasp: 'Real grasp',
+        readyGrasp: 'Prepare grasp',
+        modeHintInitial: 'Ordinary grasp points update automatically; start with --enable-robot for real grasp.',
+        modeHintConnected: 'Ordinary grasp points update automatically; Real grasp uses the current ordinary grasp first.',
+        modeHintDisconnected: 'Ordinary grasp points update automatically; restart with --enable-robot for real grasp.',
+        cameraStreamAlt: 'camera stream',
+        compensationTitle: 'Compensation',
+        gripperOffsetLabel: 'Gripper F/L/U (m)',
+        gripperRpyLabel: 'Gripper RPY (deg)',
+        cameraXyzLabel: 'Camera XYZ (m)',
+        cameraRpyLabel: 'Camera RPY (deg)',
+        baseXyzLabel: 'Base XYZ (m)',
+        baseRpyLabel: 'Base RPY (deg)',
+        setOffset: 'Set compensation',
+        baseJogTitle: 'Base motor debug',
+        baseJogDegLabel: 'joint1 jog (deg)',
+        baseJogApply: 'Run base jog',
+        loading: 'loading...',
+        forwardOffsetTitle: 'Forward/back gripper compensation; positive moves along the approach direction',
+        lateralOffsetTitle: 'Left/right gripper compensation; positive along the gripper Y axis',
+        verticalOffsetTitle: 'Up/down gripper compensation; positive along the gripper Z axis',
+        rollOffsetTitle: 'Gripper roll compensation',
+        pitchOffsetTitle: 'Gripper pitch compensation',
+        yawOffsetTitle: 'Gripper yaw compensation',
+        cameraXOffsetTitle: 'Camera X extrinsic compensation',
+        cameraYOffsetTitle: 'Camera Y extrinsic compensation',
+        cameraZOffsetTitle: 'Camera Z extrinsic compensation',
+        cameraRollOffsetTitle: 'Camera X roll extrinsic compensation',
+        cameraPitchOffsetTitle: 'Camera Y pitch extrinsic compensation',
+        cameraYawOffsetTitle: 'Camera Z yaw extrinsic compensation',
+        baseXOffsetTitle: 'Robot base X extrinsic compensation',
+        baseYOffsetTitle: 'Robot base Y extrinsic compensation',
+        baseZOffsetTitle: 'Robot base Z extrinsic compensation',
+        baseRollOffsetTitle: 'Robot base X roll extrinsic compensation',
+        basePitchOffsetTitle: 'Robot base Y pitch extrinsic compensation',
+        baseYawOffsetTitle: 'Robot base Z yaw extrinsic compensation',
+        baseJogDegTitle: 'Base motor joint1 relative angle; negative moves in the negative direction',
+        baseJogDurationTitle: 'Base motor motion duration in seconds',
+        baseJogMarginTitle: 'joint1 safety margin from limits, in degrees',
+        numberExampleError: 'must be a number, for example -0.010 or 0.080',
+        numberRequired: 'must be a number',
+        confirmGrasp: 'Run a real robot grasp?',
+        refreshingGrasp: 'Calculating GraspNet grasp points...',
+        errorPrefix: 'ERROR: ',
+        failed: 'failed',
+        stateErrorPrefix: 'state error: ',
+        autoGraspLabel: 'Auto GraspNet',
+        robotConnected: 'Robot connected',
+        robotDisconnected: 'Robot not connected',
+        baseJogDurationName: 'duration',
+        baseJogMarginName: 'safety margin'
+      }}
+    }};
+    const LANG_KEY = 'rebotGraspWebLanguage';
+    let currentLang = localStorage.getItem(LANG_KEY) === 'en' ? 'en' : 'zh';
+    let latestRobotConnected = null;
+
     const target = document.getElementById('target');
+    const languageToggle = document.getElementById('languageToggle');
     const statusEl = document.getElementById('status');
     const stateEl = document.getElementById('state');
+    const inferBtn = document.getElementById('infer');
     const graspBtn = document.getElementById('grasp');
+    const readyBtn = document.getElementById('readyPose');
     const modeHint = document.getElementById('modeHint');
     const baseJogDeg = document.getElementById('baseJogDeg');
     const baseJogDuration = document.getElementById('baseJogDuration');
@@ -1309,7 +1695,41 @@ INDEX_TEMPLATE = """<!doctype html>
       base_yaw_deg: {{ el: document.getElementById('baseYawOffset'), digits: 1 }}
     }};
     let compensationDirty = false;
+    let inferRequestInFlight = false;
     let graspRequestInFlight = false;
+    let readyRequestInFlight = false;
+
+    function tr(key) {{
+      return (I18N[currentLang] && I18N[currentLang][key]) || I18N.zh[key] || key;
+    }}
+
+    function updateModeHint(robotConnected) {{
+      latestRobotConnected = robotConnected === null || robotConnected === undefined ? null : Boolean(robotConnected);
+      modeHint.textContent = latestRobotConnected === null
+        ? tr('modeHintInitial')
+        : (latestRobotConnected ? tr('modeHintConnected') : tr('modeHintDisconnected'));
+    }}
+
+    function applyLanguage(lang) {{
+      currentLang = lang === 'en' ? 'en' : 'zh';
+      localStorage.setItem(LANG_KEY, currentLang);
+      document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
+      for (const el of document.querySelectorAll('[data-i18n]')) {{
+        el.textContent = tr(el.dataset.i18n);
+      }}
+      for (const el of document.querySelectorAll('[data-i18n-title]')) {{
+        el.title = tr(el.dataset.i18nTitle);
+      }}
+      for (const el of document.querySelectorAll('[data-i18n-alt]')) {{
+        el.alt = tr(el.dataset.i18nAlt);
+      }}
+      languageToggle.textContent = tr('languageToggle');
+      languageToggle.setAttribute('aria-pressed', currentLang === 'en' ? 'true' : 'false');
+      updateModeHint(latestRobotConnected);
+    }}
+
+    languageToggle.onclick = () => applyLanguage(currentLang === 'en' ? 'zh' : 'en');
+    applyLanguage(currentLang);
 
     for (const cfg of Object.values(compensationInputs)) {{
       cfg.el.addEventListener('input', () => {{
@@ -1330,7 +1750,7 @@ INDEX_TEMPLATE = """<!doctype html>
       const raw = String(cfg.el.value).trim().replace('−', '-');
       const value = Number(raw);
       if (!Number.isFinite(value)) {{
-        throw new Error(key + ' 请输入数字，例如 -0.010 或 0.080');
+        throw new Error(key + ' ' + tr('numberExampleError'));
       }}
       return value;
     }}
@@ -1339,7 +1759,7 @@ INDEX_TEMPLATE = """<!doctype html>
       const raw = String(el.value).trim().replace('−', '-');
       const value = Number(raw);
       if (!Number.isFinite(value)) {{
-        throw new Error(name + ' 请输入数字');
+        throw new Error(name + ' ' + tr('numberRequired'));
       }}
       return value;
     }}
@@ -1351,13 +1771,34 @@ INDEX_TEMPLATE = """<!doctype html>
         body: JSON.stringify(body)
       }});
       const data = await res.json();
-      statusEl.textContent = data.ok ? 'OK' : ('ERROR: ' + (data.error || data.status || 'failed'));
+      statusEl.textContent = data.ok ? 'OK' : (tr('errorPrefix') + (data.error || data.status || tr('failed')));
       stateEl.textContent = JSON.stringify(data, null, 2);
       return data;
     }}
 
-    function setTargetAndQueueGrasp() {{
-      post('/target', {{class_name: target.value}});
+    async function refreshGraspNow() {{
+      if (inferRequestInFlight) return;
+      inferRequestInFlight = true;
+      inferBtn.disabled = true;
+      try {{
+        await post('/infer');
+      }} catch (e) {{
+        statusEl.textContent = tr('errorPrefix') + e.message;
+      }} finally {{
+        inferRequestInFlight = false;
+      }}
+    }}
+
+    async function setTargetAndQueueGrasp() {{
+      try {{
+        const data = await post('/target', {{class_name: target.value}});
+        if (data.ok) {{
+          statusEl.textContent = tr('refreshingGrasp');
+          refreshGraspNow();
+        }}
+      }} catch (e) {{
+        statusEl.textContent = tr('errorPrefix') + e.message;
+      }}
     }}
 
     target.onchange = setTargetAndQueueGrasp;
@@ -1374,7 +1815,7 @@ INDEX_TEMPLATE = """<!doctype html>
           applyCompensation(data.compensation || {{}});
         }}
       }} catch (e) {{
-        statusEl.textContent = 'ERROR: ' + e.message;
+        statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }};
     async function jogBase(deltaOverride) {{
@@ -1382,15 +1823,15 @@ INDEX_TEMPLATE = """<!doctype html>
         const delta = deltaOverride === undefined ? readNumberInput(baseJogDeg, 'joint1 jog') : deltaOverride;
         const payload = {{
           delta_deg: delta,
-          duration_s: readNumberInput(baseJogDuration, '运动时长'),
-          safety_margin_deg: readNumberInput(baseJogMargin, '限位安全边距')
+          duration_s: readNumberInput(baseJogDuration, tr('baseJogDurationName')),
+          safety_margin_deg: readNumberInput(baseJogMargin, tr('baseJogMarginName'))
         }};
         const data = await post('/base_jog', payload);
         if (data.ok) {{
           baseJogDeg.value = Number(data.delta_deg || delta).toFixed(1);
         }}
       }} catch (e) {{
-        statusEl.textContent = 'ERROR: ' + e.message;
+        statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }}
     document.getElementById('baseJogNeg').onclick = () => {{
@@ -1398,7 +1839,7 @@ INDEX_TEMPLATE = """<!doctype html>
         const step = Math.abs(readNumberInput(baseJogDeg, 'joint1 jog') || 30);
         jogBase(-step);
       }} catch (e) {{
-        statusEl.textContent = 'ERROR: ' + e.message;
+        statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }};
     document.getElementById('baseJogApply').onclick = () => jogBase();
@@ -1407,18 +1848,27 @@ INDEX_TEMPLATE = """<!doctype html>
         const step = Math.abs(readNumberInput(baseJogDeg, 'joint1 jog') || 30);
         jogBase(step);
       }} catch (e) {{
-        statusEl.textContent = 'ERROR: ' + e.message;
+        statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }};
-    document.getElementById('infer').onclick = () => post('/infer');
+    inferBtn.onclick = () => refreshGraspNow();
     document.getElementById('grasp').onclick = async () => {{
-      if (!confirm('确认执行真实抓取？')) return;
+      if (!confirm(tr('confirmGrasp'))) return;
       graspRequestInFlight = true;
       graspBtn.disabled = true;
       try {{
         await post('/grasp');
       }} finally {{
         graspRequestInFlight = false;
+      }}
+    }};
+    readyBtn.onclick = async () => {{
+      readyRequestInFlight = true;
+      readyBtn.disabled = true;
+      try {{
+        await post('/ready');
+      }} finally {{
+        readyRequestInFlight = false;
       }}
     }};
 
@@ -1431,19 +1881,22 @@ INDEX_TEMPLATE = """<!doctype html>
         if (!compensationDirty) {{
           applyCompensation(comp);
         }}
-        const autoText = data.auto_graspnet ? ('自动抓取点: ' + data.graspnet_interval_s + 's') : '自动抓取点: off';
-        const robotText = data.robot_connected ? '机械臂已连接' : '机械臂未连接';
-        statusEl.textContent = autoText + ' | ' + robotText + ' | ' + data.status + ' | ' + data.target_status;
+        const autoText = data.auto_graspnet ? (tr('autoGraspLabel') + ': ' + data.graspnet_interval_s + 's') : tr('autoGraspLabel') + ': off';
+        const ordinaryText = data.ordinary_grasp
+          ? ('ordinary: ' + data.ordinary_grasp.target + ' ' + Number(data.ordinary_grasp.score || 0).toFixed(2))
+          : (data.ordinary_status || 'ordinary: waiting');
+        const robotText = data.robot_connected ? tr('robotConnected') : tr('robotDisconnected');
+        statusEl.textContent = autoText + ' | ' + ordinaryText + ' | ' + robotText + ' | ' + data.status + ' | ' + data.target_status;
+        inferBtn.disabled = data.busy || inferRequestInFlight;
         graspBtn.disabled = !data.robot_connected || graspRequestInFlight;
+        readyBtn.disabled = !data.robot_connected || data.busy || readyRequestInFlight || graspRequestInFlight;
         for (const btn of baseJogButtons) {{
-          btn.disabled = !data.robot_connected || data.busy || graspRequestInFlight;
+          btn.disabled = !data.robot_connected || data.busy || graspRequestInFlight || readyRequestInFlight;
         }}
-        modeHint.textContent = data.robot_connected
-          ? '自动只更新 GraspNet 抓取点；点击真实抓取才会移动机械臂'
-          : '自动只更新 GraspNet 抓取点；真实抓取需重启脚本并加 --enable-robot';
+        updateModeHint(data.robot_connected);
         stateEl.textContent = JSON.stringify(data, null, 2);
       }} catch (e) {{
-        statusEl.textContent = 'state error: ' + e;
+        statusEl.textContent = tr('stateErrorPrefix') + e;
       }}
     }}
     setInterval(refresh, 700);
@@ -1480,6 +1933,8 @@ class GraspWebHandler(BaseHTTPRequestHandler):
             self._send_json(self.app.set_forward_offset(float(payload.get("offset_m", 0.0))))
         elif path == "/base_jog":
             self._send_json(self.app.jog_base(self._read_payload()))
+        elif path == "/ready":
+            self._send_json(self.app.prepare_grasp())
         elif path == "/infer":
             self._send_json(self.app.run_grasp(execute=False))
         elif path == "/grasp":
@@ -1500,7 +1955,7 @@ class GraspWebHandler(BaseHTTPRequestHandler):
         return {key: values[-1] for key, values in parsed.items()}
 
     def _index_html(self) -> str:
-        options = ['<option value="">Best detection</option>']
+        options = ['<option value="" data-i18n="bestDetection">最佳检测</option>']
         for name in self.app.class_names:
             selected = " selected" if name == self.app.target_class else ""
             escaped = html.escape(name, quote=True)

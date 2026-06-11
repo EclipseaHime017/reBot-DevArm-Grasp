@@ -80,4 +80,6 @@ grasp_pipeline:
     base_direction: auto
     base_rotate_duration: 2.5
     base_safety_margin_deg: 5.0
+    stow_before_base_rotate: true
+    stow_duration: 2.5
     return_home: true
